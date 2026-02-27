@@ -1,0 +1,26 @@
+tasks:
+  funding_rate_collection:
+    enabled: true
+    task_class: notebook
+
+    schedule:
+      type: frequency
+      frequency_hours: 1.0
+      timezone: Europe/Rome
+
+    max_retries: 2
+    retry_delay_seconds: 60
+    timeout_seconds: 300
+
+    config:
+      notebooks:
+        - path: "funding_rate_collection/collect_funding_rates.ipynb"
+      output_dir: "app/outputs/funding_rates"
+      save_outputs: false
+      kernel_name: "python3"
+      timeout: "5m"
+      execution: "sequential"
+
+    tags:
+      - funding_rates
+      - data_collection

@@ -1,0 +1,169 @@
+name: "🔍 Research Task"
+description: "Agent-executable research/investigation task"
+labels: ["research"]
+body:
+  - type: textarea
+    id: spec
+    attributes:
+      label: Research Question
+      description: "What to investigate. Be specific about what you need to know and why."
+      placeholder: |
+        Investigate X. We need to understand:
+        1. How does Y work?
+        2. What are the tradeoffs between A and B?
+        3. Is Z feasible given our constraints?
+
+        Output: write findings to `research/{slug}.md`
+    validations:
+      required: true
+
+  - type: textarea
+    id: scope-boundary
+    attributes:
+      label: "Scope Boundary (Stopping Condition)"
+      description: "When does research STOP? Define by sources exhausted, questions answered, contradictions found, or time box."
+      placeholder: |
+        Research stops when:
+        - [ ] 5+ high-confidence sources agree on each finding, OR
+        - [ ] 10 sources exhausted with no consensus, OR
+        - [ ] 4 hours spent (whichever comes first)
+        
+        If contradictions found, document both positions with sources.
+      validations:
+        required: true
+
+  - type: textarea
+    id: success-criteria
+    attributes:
+      label: "Success Criteria (Measurable)"
+      description: "How do we know research is complete? Use numbers: N sources, M findings, confidence thresholds."
+      placeholder: |
+        Research is complete when:
+        - [ ] ≥5 findings documented
+        - [ ] Each finding rated HIGH/MEDIUM/LOW
+        - [ ] HIGH findings have ≥2 independent sources
+        - [ ] 'What I did NOT find' section included
+        - [ ] All major contradictions explained
+      validations:
+        required: true
+
+  - type: textarea
+    id: dod
+    attributes:
+      label: Definition of Done
+      description: "Verifiable completion criteria. DO NOT add items beyond this list."
+      value: |
+        - [ ] All success criteria met
+        - [ ] Findings written to specified output path
+        - [ ] Each finding rated: HIGH (multiple sources), MEDIUM (single source/strong inference), LOW (speculation)
+        - [ ] "What did I NOT find?" section included
+        - [ ] Sources cited (links or references)
+        - [ ] Changes committed and pushed to remote
+        - [ ] Closing comment posted (exact format below)
+        - [ ] Issue closed via `gh issue close {NUMBER} --repo {REPO}`
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Context & References
+      description: "Links to prior research, related issues, relevant files, constraints."
+      placeholder: |
+        - Related to #42 (connector build needs this research)
+        - Existing notes: `research/prior-work.md`
+        - Constraints: [link to constraints doc]
+
+  - type: textarea
+    id: rules
+    attributes:
+      label: Agent Rules
+      description: "Execution constraints for the agent."
+      value: |
+        - Do NOT implement code. Research only.
+        - Self-assess confidence per finding: HIGH / MEDIUM / LOW
+        - Answer "What did I NOT find?" at the end — be explicit about gaps
+        - If reliable information unavailable after exhausting sources, say so clearly rather than speculating
+        - Cross-reference findings across ≥2 independent sources before rating as HIGH
+        - Stop at scope boundary, even if more sources exist
+
+        ## Self-Review (before closure)
+        1. Re-read the Spec and Acceptance Criteria
+        2. Verify EACH criterion individually (not just "tests pass")
+        3. Check for scope creep: did you add anything NOT in the spec? Remove it.
+        4. Check for missing work: did you skip anything IN the spec? Complete it.
+
+        ## Research Tools (mandatory)
+        Use the research pipeline at `~/.openclaw/workspace/skills/research-pipeline/scripts/`:
+        - `./research.sh grok "query"` — X/Twitter search and real-time web via Grok
+        - `./research.sh google "query"` — Google AI mode for deep web research
+        - `./research.sh gemini "query"` — Gemini synthesis for cross-referencing
+        - Add `--summarize` for local Qwen summary, `--output path.md` to save raw output
+        - Use `web_search` and `web_fetch` tools for targeted URL lookups and verification
+
+        ## Branch Setup (mandatory, before any work)
+        **ALWAYS branch from latest origin/main.** This ensures your branch includes
+        all previously merged dependency work (blocked_by issues).
+
+        ```bash
+        git fetch origin main
+        git checkout -b feat/{issue-number}-{slug} origin/main
+        ```
+
+        ## Closure Protocol (mandatory, exact order)
+        **IMPORTANT: Push → rebase → PR → MERGE → comment → close. An issue is NOT done until its code is on main.**
+
+        1. `git add` + `git commit` + `git push` — push research files to remote FIRST
+        2. Rebase onto main:
+           ```bash
+           git fetch origin main && git rebase origin/main
+           ```
+           - If conflicts: resolve favoring your functional changes, preserving main's formatting
+           - After resolving, force-push: `git push --force-with-lease`
+           - If rebase fails after 2 attempts, push branch as-is with note in closing comment
+        3. Open PR:
+           ```bash
+           gh pr create --base main --head feat/{issue-number}-{slug} \
+             --title "#{issue-number}: {title}" \
+             --body "Closes #{issue-number}"
+           ```
+        4. Merge PR (if rebase is clean):
+           ```bash
+           gh pr merge {pr-number} --repo {REPO} --squash --delete-branch
+           ```
+           - If merge conflicts remain: add label `needs-rebase`, post comment explaining conflict, add label `blocked` to issue, and STOP (do not close issue)
+        5. Post a closing comment via `gh issue comment {NUMBER} --repo {REPO}`:
+           ```
+           ## Completion
+           **Commit:** {sha} (short hash, must be on remote)
+           **Merged:** ✅ PR #{pr-number} squash-merged to main
+           **Files:** 
+           - Created: [list of research files]
+           **Summary:** 2-3 sentence overview of research findings
+           **Key findings:** [2-3 bullet points with confidence ratings]
+           **Top finding:** the single most important discovery
+           **Gaps:** what was NOT found or needs deeper investigation
+           **Sources consulted:** number of sources reviewed
+           **Verification:**
+           - Criterion 1: [PASS] [evidence — e.g., test output snippet, metric value]
+           - Criterion 2: [PASS] [evidence]
+           ```
+        6. `gh issue close {NUMBER} --repo {REPO}`
+
+        Example:
+        ```
+        ## Completion
+        **Commit:** abc1234
+        **Files:**
+        - Created: `research/issue-quality-patterns.md`
+        **Summary:** Investigated how GitHub issues correlate with AI agent success rates. Analyzed 12 top OSS projects (Rust, React, K8s) and synthesized 10 core quality patterns. Confidence: HIGH across INCOSE rules, MEDIUM on agent-specific patterns.
+        **Key findings:**
+        - Structured YAML fields → 84% agent success vs 52% freeform (HIGH)
+        - Closure protocol example → 100% compliance vs 0% without (HIGH)
+        - 200-500 word optimal issue length (HIGH)
+        **Top finding:** Template detail (especially closure examples) is the highest-leverage factor in agent compliance.
+        **Gaps:** No cross-model portability research (will Claude spec work for GPT-5?). No quantitative ROI data.
+        **Sources consulted:** 15 primary (OSS templates, RFC processes), 8 secondary (academic papers)
+        **Verification:**
+        - Criterion 1 (≥5 findings documented): [PASS] 10 findings documented in research/issue-quality-patterns.md
+        - Criterion 2 (each finding rated): [PASS] All 10 findings rated HIGH/MEDIUM/LOW
+        - Criterion 3 (HIGH findings have 2+ sources): [PASS] 6 HIGH findings each cite ≥2 sources
+        ```

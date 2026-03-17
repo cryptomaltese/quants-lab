@@ -1,0 +1,167 @@
+name: "🔨 Build Task"
+description: "Agent-executable build/implementation task"
+labels: ["build"]
+body:
+  - type: textarea
+    id: spec
+    attributes:
+      label: Spec
+      description: "What to build. 200-400 words. This IS the agent prompt."
+      placeholder: |
+        Implement X using Y.
+
+        Requirements:
+        - ...
+        - ...
+
+        Files to modify:
+        - `src/foo.py`
+    validations:
+      required: true
+
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: "Acceptance Criteria (Measurable, Atomic)"
+      description: "One criterion per line. Use numbers, not adjectives. Example: 'p99 latency ≤ 100ms' not 'fast'."
+      placeholder: |
+        - [ ] Test X passes (verify via: npm run test)
+        - [ ] No regression in metric Y (current: Z, target: ≤Z)
+        - [ ] Backward compatible with v1.x
+        - [ ] Linter clean (eslint --fix)
+      validations:
+        required: true
+
+  - type: textarea
+    id: constraints
+    attributes:
+      label: "Constraints & Failure Modes (Explicit)"
+      description: "What must we NOT do? What could go wrong? Prevent R5 1.5 (implicit constraints)."
+      placeholder: |
+        ## Must Not
+        - [ ] Break backward compatibility
+        - [ ] Increase memory footprint by >5%
+        - [ ] Add external dependencies without approval
+        
+        ## Failure Modes to Avoid
+        - If network fails mid-operation, system shall [recovery]
+        - If timeout occurs, system shall [graceful degradation]
+      validations:
+        required: false
+
+  - type: textarea
+    id: backpressure
+    attributes:
+      label: Backpressure
+      description: "Test commands the agent MUST run after every change. Failures halt progress."
+      value: |
+        ```bash
+        cd <project-root> && python -m pytest tests/ -x
+        ```
+      render: bash
+
+  - type: textarea
+    id: dod
+    attributes:
+      label: Definition of Done
+      description: "Verifiable completion criteria. DO NOT add items beyond this list."
+      value: |
+        - [ ] All acceptance criteria met
+        - [ ] Backpressure tests pass (exit 0)
+        - [ ] Code committed on branch `feat/{issue-number}-{slug}`
+        - [ ] Branch pushed to remote
+        - [ ] Closing comment posted (exact format below)
+        - [ ] Issue closed via `gh issue close {NUMBER} --repo {REPO}`
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Context & References
+      description: "Links to prior issues, handoff comments, relevant files, dependencies."
+      placeholder: |
+        - Depends on #42 (see handoff comment)
+        - Config: `builds/project/conf/config.yml`
+        - Related ADR: [link-to-adr]
+
+  - type: textarea
+    id: rules
+    attributes:
+      label: Agent Rules
+      description: "Execution constraints for the agent."
+      value: |
+        - Work on branch: `feat/{issue-number}-{slug}`
+        - **TDD: write test files BEFORE implementation files.** Commit tests first, then implement until they pass.
+        - Run backpressure tests after every change. If tests fail 3 times on the same error, STOP.
+        - Commit with message prefix: `#{issue-number}: `
+        - Do NOT modify files outside your branch
+        - Do NOT work on any other issue
+        - Do NOT refactor unrelated code
+
+        ## Self-Review (before closure)
+        1. Re-read the Spec and Acceptance Criteria
+        2. Verify EACH criterion individually (not just "tests pass")
+        3. Check for scope creep: did you add anything NOT in the spec? Remove it.
+        4. Check for missing work: did you skip anything IN the spec? Complete it.
+
+        ## Branch Setup (mandatory, before any work)
+        **ALWAYS branch from latest origin/main.** This ensures your branch includes
+        all previously merged dependency work (blocked_by issues).
+
+        ```bash
+        git fetch origin main
+        git checkout -b feat/{issue-number}-{slug} origin/main
+        ```
+
+        ## Closure Protocol (mandatory, exact order)
+        **IMPORTANT: Push → rebase → PR → MERGE → comment → close. An issue is NOT done until its code is on main.**
+
+        1. `git push` — push all commits to remote FIRST
+        2. Rebase onto main:
+           ```bash
+           git fetch origin main && git rebase origin/main
+           ```
+           - If conflicts: resolve favoring your functional changes, preserving main's formatting
+           - After resolving, force-push: `git push --force-with-lease`
+           - If rebase fails after 2 attempts, push branch as-is with note in closing comment
+        3. Open PR:
+           ```bash
+           gh pr create --base main --head feat/{issue-number}-{slug} \
+             --title "#{issue-number}: {title}" \
+             --body "Closes #{issue-number}" \
+             --label "review-needed"
+           ```
+        4. Merge PR (if rebase is clean and backpressure passes):
+           ```bash
+           gh pr merge {pr-number} --repo {REPO} --squash --delete-branch
+           ```
+           - If merge conflicts remain: add label `needs-rebase`, post comment explaining conflict, add label `blocked` to issue, and STOP (do not close issue)
+        5. Post a closing comment via `gh issue comment {NUMBER} --repo {REPO}`:
+           ```
+           ## Completion
+           **Commit(s):** {sha1}, {sha2} (short hashes, must be on remote)
+           **Merged:** ✅ PR #{pr-number} squash-merged to main
+           **Files:** 
+           - Created: [list]
+           - Modified: [list]
+           **Summary:** 2-3 sentences of what was implemented
+           **Tests:** All backpressure tests pass
+           **Verification:**
+           - Criterion 1: [PASS] [evidence — e.g., test output snippet, metric value]
+           - Criterion 2: [PASS] [evidence]
+           ```
+        6. `gh issue close {NUMBER} --repo {REPO}`
+
+        Example:
+        ```
+        ## Completion
+        **Commit(s):** abc1234, def5678
+        **Merged:** ✅ PR #65 squash-merged to main
+        **Files:**
+        - Created: `spec-reviewer/lenses/closure-protocol.py`
+        - Modified: `spec-reviewer/SKILL.md`
+        **Summary:** Added Closure Protocol Lens to detect missing protocol examples. Updated skill docs with usage examples. Tested against 5 real issues.
+        **Tests:** All pytest cases pass; backpressure clean
+        **Verification:**
+        - Criterion 1 (test X passes): [PASS] 5 of 5 pytest cases passed, runtime 2.3s
+        - Criterion 2 (no regression): [PASS] p99 latency unchanged at 45ms
+        ```

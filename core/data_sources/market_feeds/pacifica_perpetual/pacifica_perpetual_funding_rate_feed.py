@@ -30,11 +30,15 @@ class PacificaPerpetualFundingRateFeed(PacificaPerpetualBase):
             except (ValueError, TypeError):
                 continue
             mark = _safe_float(item.get("mark"))
+            best_bid = _safe_float(item.get("bid"))
+            best_ask = _safe_float(item.get("ask"))
             rows.append({
                 "trading_pair": sym,
                 "funding_rate": funding_rate,
                 "mark_price": mark if mark is not None else float("nan"),
                 "index_price": float("nan"),
+                "best_bid": best_bid if best_bid is not None else float("nan"),
+                "best_ask": best_ask if best_ask is not None else float("nan"),
             })
         return rows
 

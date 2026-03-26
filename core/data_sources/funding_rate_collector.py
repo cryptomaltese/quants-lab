@@ -53,11 +53,16 @@ class FundingRateCollector:
             return pd.DataFrame(columns=[
                 "timestamp", "venue", "trading_pair",
                 "funding_rate_1h", "mark_price", "index_price",
+                "best_bid", "best_ask",
             ])
 
         combined = pd.concat(dfs, ignore_index=True)
         combined.rename(columns={"funding_rate": "funding_rate_1h"}, inplace=True)
-        return combined[["timestamp", "venue", "trading_pair", "funding_rate_1h", "mark_price", "index_price"]]
+        # Ensure best_bid/best_ask columns exist even if all feeds omitted them
+        for col in ("best_bid", "best_ask"):
+            if col not in combined.columns:
+                combined[col] = float("nan")
+        return combined[["timestamp", "venue", "trading_pair", "funding_rate_1h", "mark_price", "index_price", "best_bid", "best_ask"]]
 
     async def close(self):
         for feed in self.feeds:

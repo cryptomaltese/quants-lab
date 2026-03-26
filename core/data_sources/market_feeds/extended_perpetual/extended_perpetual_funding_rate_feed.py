@@ -40,11 +40,15 @@ class ExtendedPerpetualFundingRateFeed(ExtendedPerpetualBase):
                 if bid is not None and ask is not None:
                     index = (bid + ask) / 2.0
 
+            best_bid = _safe_float(ms.get("bidPrice"))
+            best_ask = _safe_float(ms.get("askPrice"))
             rows.append({
                 "trading_pair": self._norm(item.get("assetName", "")),
                 "funding_rate": funding_rate,
                 "mark_price": mark if mark is not None else float("nan"),
                 "index_price": index if index is not None else float("nan"),
+                "best_bid": best_bid if best_bid is not None else float("nan"),
+                "best_ask": best_ask if best_ask is not None else float("nan"),
             })
         return rows
 

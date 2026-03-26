@@ -18,18 +18,23 @@ class FundingRateFeedBase(ConnectorBase):
     @abstractmethod
     async def _fetch_funding_rates(self) -> list[dict]:
         """Return a list of dicts with keys:
-        trading_pair, funding_rate (per-hour), mark_price, index_price (or NaN).
+        trading_pair, funding_rate (per-hour), mark_price, index_price (or NaN),
+        best_bid (or NaN), best_ask (or NaN).
         """
+
+    _COLUMNS = ["timestamp", "trading_pair", "funding_rate", "mark_price", "index_price", "best_bid", "best_ask"]
 
     async def get_all_funding_rates(self) -> pd.DataFrame:
         """Fetch funding rates for all available pairs."""
         rows = await self._fetch_funding_rates()
         if not rows:
-            return pd.DataFrame(columns=["timestamp", "trading_pair", "funding_rate", "mark_price", "index_price"])
+            return pd.DataFrame(columns=self._COLUMNS)
         now = datetime.now(timezone.utc)
         for r in rows:
             r.setdefault("timestamp", now)
-        df = pd.DataFrame(rows, columns=["timestamp", "trading_pair", "funding_rate", "mark_price", "index_price"])
+            r.setdefault("best_bid", float("nan"))
+            r.setdefault("best_ask", float("nan"))
+        df = pd.DataFrame(rows, columns=self._COLUMNS)
         return df
 
     async def get_funding_rates(self, trading_pairs: list[str]) -> pd.DataFrame:

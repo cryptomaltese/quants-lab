@@ -34,11 +34,22 @@ class HyperliquidPerpetualFundingRateFeed(HyperliquidPerpetualBase):
                 except (ValueError, TypeError):
                     continue
                 mark = _safe_float(ctx.get("markPx"))
+                # bid/ask from impactPxs; fall back to midPx if unavailable
+                impact_pxs = ctx.get("impactPxs")
+                if impact_pxs and len(impact_pxs) >= 2:
+                    best_bid = _safe_float(impact_pxs[0])
+                    best_ask = _safe_float(impact_pxs[1])
+                else:
+                    mid = _safe_float(ctx.get("midPx"))
+                    best_bid = mid
+                    best_ask = mid
                 rows.append({
                     "trading_pair": sym,
                     "funding_rate": funding_rate,
                     "mark_price": mark if mark is not None else float("nan"),
                     "index_price": float("nan"),  # not directly available
+                    "best_bid": best_bid if best_bid is not None else float("nan"),
+                    "best_ask": best_ask if best_ask is not None else float("nan"),
                 })
         return rows
 

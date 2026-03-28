@@ -222,33 +222,39 @@ class TestExtendedBidAsk:
 # ---------------------------------------------------------------------------
 
 class TestLighterBidAsk:
-    """Lighter feed: best_bid/best_ask from exchangeStats if available, NaN otherwise."""
+    """Lighter feed: best_bid/best_ask from per-symbol orderbook (issue #45 fix).
+
+    Updated from #44 (exchangeStats) to #45 (orderbook via orderBookOrders endpoint).
+    The exchangeStats endpoint does not expose bid/ask; orderbook provides real prices.
+    """
 
     def _make_funding_response(self, items):
         return {"funding_rates": items}
 
-    def _make_exchange_stats_response(self, items):
-        return {"order_book_stats": items}
+    def _make_ob_response(self, bid_price: str, ask_price: str):
+        return {
+            "code": 200,
+            "total_bids": 1,
+            "total_asks": 1,
+            "bids": [{"price": bid_price, "remaining_base_amount": "1.0"}],
+            "asks": [{"price": ask_price, "remaining_base_amount": "1.0"}],
+        }
 
     @pytest.mark.asyncio
-    async def test_bid_ask_from_exchange_stats(self):
-        """best_bid from bid_price, best_ask from ask_price in exchangeStats."""
+    async def test_bid_ask_from_orderbook(self):
+        """best_bid/best_ask fetched from per-symbol orderbook (market_id from funding-rates)."""
         from core.data_sources.market_feeds.lighter_perpetual.lighter_perpetual_funding_rate_feed import LighterPerpetualFundingRateFeed
 
         funding_data = self._make_funding_response([
-            {"symbol": "BTC-PERP", "rate": "0.0008", "exchange": "lighter"},
+            {"market_id": 1, "symbol": "BTC", "rate": "0.0008", "exchange": "lighter"},
         ])
-        stats_data = self._make_exchange_stats_response([
-            {"symbol": "BTC/USDC", "last_trade_price": "50000", "bid_price": "49990", "ask_price": "50010"},
-        ])
+        ob_data = self._make_ob_response("49990", "50010")
 
         feed = LighterPerpetualFundingRateFeed()
-        call_count = [0]
-        async def mock_request(method, url, **kwargs):
-            call_count[0] += 1
+        async def mock_request(method, url, params=None, **kwargs):
             if "funding-rates" in url:
                 return funding_data
-            return stats_data
+            return ob_data
 
         with patch.object(feed, "_make_request", new=mock_request):
             rows = await feed._fetch_funding_rates()
@@ -258,22 +264,19 @@ class TestLighterBidAsk:
         assert rows[0]["best_ask"] == pytest.approx(50010.0)
 
     @pytest.mark.asyncio
-    async def test_nan_when_bid_ask_missing_in_stats(self):
-        """NaN when exchangeStats lacks bid_price/ask_price."""
+    async def test_nan_when_orderbook_fails(self):
+        """NaN when orderbook fetch fails."""
         from core.data_sources.market_feeds.lighter_perpetual.lighter_perpetual_funding_rate_feed import LighterPerpetualFundingRateFeed
 
         funding_data = self._make_funding_response([
-            {"symbol": "ETH-PERP", "rate": "0.0008", "exchange": "lighter"},
-        ])
-        stats_data = self._make_exchange_stats_response([
-            {"symbol": "ETH/USDC", "last_trade_price": "3000"},
+            {"market_id": 0, "symbol": "ETH", "rate": "0.0008", "exchange": "lighter"},
         ])
 
         feed = LighterPerpetualFundingRateFeed()
-        async def mock_request(method, url, **kwargs):
+        async def mock_request(method, url, params=None, **kwargs):
             if "funding-rates" in url:
                 return funding_data
-            return stats_data
+            raise Exception("network error")
 
         with patch.object(feed, "_make_request", new=mock_request):
             rows = await feed._fetch_funding_rates()
@@ -283,33 +286,30 @@ class TestLighterBidAsk:
         assert math.isnan(rows[0]["best_ask"])
 
     @pytest.mark.asyncio
-    async def test_no_extra_api_calls(self):
-        """Bid/ask reuses the existing exchangeStats call - no new endpoints."""
+    async def test_orderbook_calls_use_market_id(self):
+        """Orderbook calls pass market_id param from funding-rates response."""
         from core.data_sources.market_feeds.lighter_perpetual.lighter_perpetual_funding_rate_feed import LighterPerpetualFundingRateFeed
 
         funding_data = self._make_funding_response([
-            {"symbol": "BTC-PERP", "rate": "0.0008", "exchange": "lighter"},
+            {"market_id": 42, "symbol": "BTC", "rate": "0.0008", "exchange": "lighter"},
         ])
-        stats_data = self._make_exchange_stats_response([
-            {"symbol": "BTC/USDC", "last_trade_price": "50000", "bid_price": "49990", "ask_price": "50010"},
-        ])
+        ob_data = self._make_ob_response("50000", "50010")
 
-        urls_called = []
+        captured_params = []
         feed = LighterPerpetualFundingRateFeed()
-        async def mock_request(method, url, **kwargs):
-            urls_called.append(url)
+        async def mock_request(method, url, params=None, **kwargs):
             if "funding-rates" in url:
                 return funding_data
-            return stats_data
+            if "orderBookOrders" in url:
+                captured_params.append(params or {})
+                return ob_data
+            return {}
 
         with patch.object(feed, "_make_request", new=mock_request):
             await feed._fetch_funding_rates()
 
-        # Only 2 known endpoints: funding-rates + exchangeStats
-        unique_urls = set(urls_called)
-        known_paths = {"funding-rates", "exchangeStats"}
-        for url in unique_urls:
-            assert any(p in url for p in known_paths), f"Unexpected URL called: {url}"
+        assert len(captured_params) == 1
+        assert str(captured_params[0].get("market_id")) == "42"
 
 
 # ---------------------------------------------------------------------------

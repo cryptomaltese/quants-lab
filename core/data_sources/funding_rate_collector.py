@@ -8,6 +8,7 @@ from .market_feeds.extended_perpetual.extended_perpetual_funding_rate_feed impor
 from .market_feeds.hyperliquid_perpetual.hyperliquid_perpetual_funding_rate_feed import HyperliquidPerpetualFundingRateFeed
 from .market_feeds.lighter_perpetual.lighter_perpetual_funding_rate_feed import LighterPerpetualFundingRateFeed
 from .market_feeds.pacifica_perpetual.pacifica_perpetual_funding_rate_feed import PacificaPerpetualFundingRateFeed
+from .market_feeds.paradex_perpetual.paradex_perpetual_funding_rate_feed import ParadexPerpetualFundingRateFeed
 
 logger = logging.getLogger(__name__)
 
@@ -21,6 +22,7 @@ class FundingRateCollector:
             HyperliquidPerpetualFundingRateFeed(),
             LighterPerpetualFundingRateFeed(),
             PacificaPerpetualFundingRateFeed(),
+            ParadexPerpetualFundingRateFeed(),
         ]
 
     async def collect(self, symbols: list[str] | None = None) -> pd.DataFrame:

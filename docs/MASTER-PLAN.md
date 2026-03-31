@@ -643,79 +643,100 @@ This is dramatically simpler than the current controller (which has scan + route
 
 ### SQLite Schema
 
-Two tables to support dual-cadence collection: per-minute prices and hourly funding rates.
+Three table groups: lookup tables for normalized keys, dual-cadence tick storage, and run tracking.
+
+Repeated values (venue names, symbol strings) are normalized into lookup tables with integer primary keys. Tick tables reference these via integer foreign keys — compact indexes, fast joins, consistent naming.
+
+Timestamps are stored as INTEGER (Unix epoch seconds). SQLite has no native datetime type; integers are compact (8 bytes vs ~24 for ISO-8601 text), enable fast range comparisons, and sort correctly. The TickStore converts to/from Python datetime at the API boundary.
 
 ```sql
--- Hourly funding rate snapshots (one row per venue/symbol per hour)
+-- Lookup tables: normalized keys for repeated values
+CREATE TABLE venues (
+    id   INTEGER PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE   -- "hyperliquid", "extended", "lighter", "paradex", "pacifica"
+);
+
+CREATE TABLE symbols (
+    id       INTEGER PRIMARY KEY,
+    name     TEXT NOT NULL UNIQUE,  -- canonical: "BTC", "ETH", "xyz:TSLA"
+    is_hip3  INTEGER NOT NULL DEFAULT 0,
+    dex_name TEXT NOT NULL DEFAULT ''
+);
+
+-- Hourly funding rate snapshots
 CREATE TABLE funding_ticks (
     id                      INTEGER PRIMARY KEY,
-    ts                      TEXT    NOT NULL,  -- ISO 8601, hourly granularity
-    venue                   TEXT    NOT NULL,
-    symbol                  TEXT    NOT NULL,
-    rate_1h                 REAL    NOT NULL,  -- current funding rate (decimal, per-hour)
-    predicted_rate_1h       REAL,              -- predicted next funding rate (decimal, per-hour)
-    time_of_next_funding    INTEGER,           -- unix ms of next settlement
+    ts                      INTEGER NOT NULL,   -- unix epoch seconds, hourly granularity
+    venue_id                INTEGER NOT NULL REFERENCES venues(id),
+    symbol_id               INTEGER NOT NULL REFERENCES symbols(id),
+    rate_1h                 REAL    NOT NULL,    -- current funding rate (decimal, per-hour)
+    predicted_rate_1h       REAL,                -- predicted next funding rate (nullable: not all venues provide)
+    time_of_next_funding    INTEGER,             -- unix epoch ms of next settlement
     settlement_period_hours REAL    NOT NULL DEFAULT 1.0,
-    is_hip3                 INTEGER NOT NULL DEFAULT 0,
-    dex_name                TEXT    NOT NULL DEFAULT '',
-    batch_id                TEXT    NOT NULL
+    batch_id                INTEGER NOT NULL     -- groups rows from same collection run
 );
 
-CREATE INDEX idx_funding_ts_venue_sym ON funding_ticks(ts, venue, symbol);
+CREATE INDEX idx_funding_lookup ON funding_ticks(symbol_id, venue_id, ts);
+CREATE INDEX idx_funding_ts     ON funding_ticks(ts);
 
--- Per-minute price snapshots (one row per venue/symbol per minute)
+-- Per-minute price snapshots
 CREATE TABLE price_ticks (
-    id          INTEGER PRIMARY KEY,
-    ts          TEXT    NOT NULL,  -- ISO 8601, minute granularity
-    venue       TEXT    NOT NULL,
-    symbol      TEXT    NOT NULL,
-    best_bid    REAL,
-    best_ask    REAL,
-    mark_price  REAL,
-    batch_id    TEXT    NOT NULL
+    id         INTEGER PRIMARY KEY,
+    ts         INTEGER NOT NULL,   -- unix epoch seconds, minute granularity
+    venue_id   INTEGER NOT NULL REFERENCES venues(id),
+    symbol_id  INTEGER NOT NULL REFERENCES symbols(id),
+    best_bid   REAL,
+    best_ask   REAL,
+    mark_price REAL,
+    batch_id   INTEGER NOT NULL
 );
 
-CREATE INDEX idx_price_ts_venue_sym ON price_ticks(ts, venue, symbol);
+CREATE INDEX idx_price_lookup ON price_ticks(symbol_id, venue_id, ts);
+CREATE INDEX idx_price_ts     ON price_ticks(ts);
 
--- Decision log
+-- Decision log (replay/paper output)
 CREATE TABLE decisions (
     id          INTEGER PRIMARY KEY,
     run_id      TEXT    NOT NULL,
-    ts          TEXT    NOT NULL,
+    ts          INTEGER NOT NULL,   -- unix epoch seconds
     strategy    TEXT    NOT NULL,
-    symbol      TEXT    NOT NULL,
-    action      TEXT    NOT NULL,     -- "enter", "exit", "hold"
+    symbol_id   INTEGER NOT NULL REFERENCES symbols(id),
+    action      TEXT    NOT NULL,   -- "enter", "exit", "hold"
     direction   TEXT,
-    venue_a     TEXT,
-    venue_b     TEXT,
+    venue_a_id  INTEGER REFERENCES venues(id),
+    venue_b_id  INTEGER REFERENCES venues(id),
     score_bps   REAL,
     size_usd    REAL,
     reason      TEXT,
-    meta        TEXT,                 -- JSON
+    meta        TEXT,               -- JSON blob for strategy-specific diagnostics
     position_id TEXT
 );
+
+CREATE INDEX idx_decisions_run ON decisions(run_id, ts);
 
 -- Run metadata
 CREATE TABLE runs (
     run_id      TEXT PRIMARY KEY,
     strategy    TEXT    NOT NULL,
-    mode        TEXT    NOT NULL,
-    started_at  TEXT    NOT NULL,
-    ended_at    TEXT,
-    config      TEXT    NOT NULL,     -- JSON
-    summary     TEXT                  -- JSON
+    mode        TEXT    NOT NULL,   -- "backtest" or "paper"
+    started_at  INTEGER NOT NULL,   -- unix epoch seconds
+    ended_at    INTEGER,
+    config      TEXT    NOT NULL,   -- JSON: full config snapshot
+    summary     TEXT                -- JSON: final PnL, stats
 );
 ```
 
-**Why two tables instead of one wide table:**
-- price_ticks has 1440× more rows per day than funding_ticks. Mixing them would make funding queries scan through millions of price rows.
-- Different retention policies: price_ticks can be compacted to 5-min or 15-min after 90 days. Funding_ticks are small enough to keep forever.
-- Separate indexes are more efficient for the two query patterns: "funding rates for a time range" vs "bid/ask at a specific minute."
+**Why lookup tables:** At 1-minute cadence, price_ticks accumulates ~576K rows/day. Storing "hyperliquid" (11 bytes) and "BTC" (3 bytes) as text on every row wastes ~8MB/day on strings alone. Integer FKs are 4 bytes each, with tighter indexes and faster joins.
 
-**Storage math:**
-- price_ticks: 4 venues × 100 symbols × 1440 min/day × ~80 bytes/row ≈ 46 MB/day ≈ 17 GB/year
-- funding_ticks: 4 venues × 100 symbols × 24 hours/day × ~80 bytes/row ≈ 0.77 MB/day ≈ 280 MB/year
-- SQLite with WAL mode handles this write volume comfortably. If write throughput becomes an issue (unlikely), first optimization: batch inserts per venue. Fallback: Redis as write buffer with periodic flush to SQLite.
+**Why two tick tables:**
+- price_ticks has 1440× more rows per day than funding_ticks. A single table would force funding queries to scan through millions of price rows.
+- Different retention policies: price_ticks can be compacted to 5-min or 15-min after 90 days. Funding_ticks are small enough to keep forever.
+- Separate composite indexes (`symbol_id, venue_id, ts`) are optimal for the two dominant query patterns: "funding rates for a time range" vs "bid/ask at a specific minute."
+
+**Storage math (with integer FKs):**
+- price_ticks: 4 venues × 100 symbols × 1440 min/day × ~36 bytes/row ≈ 21 MB/day ≈ 7.5 GB/year
+- funding_ticks: 4 venues × 100 symbols × 24 hours/day × ~44 bytes/row ≈ 0.42 MB/day ≈ 153 MB/year
+- SQLite with WAL mode handles this write volume comfortably. If write throughput becomes an issue (unlikely), first optimization: batch inserts per venue with `asyncio.gather()`. Fallback: per-venue SQLite databases to eliminate write contention.
 
 ### Collector (dual-cadence)
 
@@ -725,7 +746,7 @@ Two separate collector scripts, each with its own cron schedule.
 # collector/collect_funding.py — runs hourly
 async def collect_funding(db_path: str, venues: list[str]) -> int:
     """Collect funding rates + predicted rates from all venues."""
-    batch_id = datetime.utcnow().strftime("%Y%m%dT%H%M%S")
+    batch_id = int(datetime.utcnow().timestamp())
     store = TickStore(db_path)
     async with aiohttp.ClientSession() as session:
         clients = build_clients(session, venues)
@@ -744,7 +765,7 @@ async def collect_funding(db_path: str, venues: list[str]) -> int:
 # collector/collect_prices.py — runs every minute
 async def collect_prices(db_path: str, venues: list[str]) -> int:
     """Collect bid/ask/mark prices from all venues."""
-    batch_id = datetime.utcnow().strftime("%Y%m%dT%H%M%S")
+    batch_id = int(datetime.utcnow().timestamp())
     store = TickStore(db_path)
     async with aiohttp.ClientSession() as session:
         clients = build_clients(session, venues)
@@ -771,17 +792,26 @@ No credentials are needed — the collector only calls public, unauthenticated e
 
 ```python
 class TickStore:
+    """Manages SQLite read/write with normalized venue/symbol lookup tables.
+    
+    Callers pass string names (venue="hyperliquid", symbol="BTC"). 
+    TickStore resolves to integer IDs internally, inserting new 
+    lookup rows on first encounter (INSERT OR IGNORE).
+    """
+
     def insert_funding_ticks(
-        self, batch_id: str, rates: list[FundingData],
+        self, batch_id: int, rates: list[FundingData],
         predicted: dict[str, PredictedFundingData],
     ) -> int:
-        """Insert hourly funding rates with predicted rates."""
+        """Insert hourly funding rates with predicted rates.
+        Resolves venue/symbol strings to integer FKs."""
         ...
 
     def insert_price_ticks(
-        self, batch_id: str, venue: str, rates: list[FundingData],
+        self, batch_id: int, venue: str, rates: list[FundingData],
     ) -> int:
-        """Insert per-minute bid/ask/mark prices."""
+        """Insert per-minute bid/ask/mark prices.
+        Resolves venue/symbol strings to integer FKs."""
         ...
 
     def iter_ticks(
@@ -795,10 +825,16 @@ class TickStore:
         1. Funding rates: latest funding_ticks at or before this timestamp
         2. Predicted rates: from the same funding_ticks row
         3. Bid/ask: from price_ticks at the nearest minute
+        
+        Joins through venues/symbols lookup tables to return 
+        human-readable names in RateSnapshot objects.
         """
         ...
 
-    def log_decision(self, run_id: str, decision: Decision) -> None: ...
+    def log_decision(self, run_id: str, decision: Decision) -> None:
+        """Log a strategy decision. Resolves symbol/venue to FKs."""
+        ...
+    
     def save_run(self, run_id: str, config: dict, summary: dict) -> None: ...
 ```
 
@@ -808,18 +844,19 @@ class TickStore:
 def iter_ticks(self, start, end, initial_balance=1000.0,
                tick_interval_minutes=60) -> Iterator[MarketTick]:
     # Query funding ticks (hourly) and price ticks (nearest minute)
-    for ts in self._tick_timestamps(start, end, tick_interval_minutes):
-        funding_rows = self._funding_at(ts)   # latest funding at or before ts
-        price_rows = self._prices_at(ts)      # price_ticks at nearest minute
+    # Internal queries use integer FKs; joins resolve to names for RateSnapshot
+    for ts_epoch in self._tick_timestamps(start, end, tick_interval_minutes):
+        funding_rows = self._funding_at(ts_epoch)   # latest funding at or before ts
+        price_rows = self._prices_at(ts_epoch)      # price_ticks at nearest minute
 
         rates = defaultdict(list)
         for row in funding_rows:
-            # Find matching price data
-            price = price_rows.get((row['venue'], row['symbol']))
+            # row has joined venue.name, symbol.name from lookup tables
+            price = price_rows.get((row['venue_id'], row['symbol_id']))
 
             snap = RateSnapshot(
-                venue_id=row['venue'],
-                symbol=row['symbol'],
+                venue_id=row['venue_name'],
+                symbol=row['symbol_name'],
                 current_rate=row['rate_1h'] * 10000 * row['settlement_period_hours'],
                 predicted_rate=(
                     row['predicted_rate_1h'] * 10000 * row['settlement_period_hours']
@@ -828,12 +865,12 @@ def iter_ticks(self, start, end, initial_balance=1000.0,
                 best_bid=price['best_bid'] if price else 0.0,
                 best_ask=price['best_ask'] if price else 0.0,
                 mark_price=price['mark_price'] if price else 0.0,
-                timestamp=ts_to_unix(ts),
+                timestamp=float(ts_epoch),
             )
-            rates[row['symbol']].append(snap)
+            rates[row['symbol_name']].append(snap)
 
         yield MarketTick(
-            ts=datetime.fromisoformat(ts),
+            ts=datetime.utcfromtimestamp(ts_epoch),
             rates=dict(rates),
             available_balance_usd=initial_balance,
         )
@@ -1220,20 +1257,24 @@ If write latency becomes a problem (>10s per collection cycle), options in order
 
 ### Phase 1: Lab Foundation
 
-#### Issue #6: SQLite schema + tick store (dual-table)
+#### Issue #6: SQLite schema + tick store
 **Scope:** `hummingbot-lab/db/tick_store.py`, `hummingbot-lab/db/schema.sql`
 **Work:**
-- Implement dual-table schema: `funding_ticks` + `price_ticks`
-- `insert_funding_ticks()`: stores rate_1h + predicted_rate_1h + time_of_next_funding
-- `insert_price_ticks()`: stores best_bid, best_ask, mark_price
-- `iter_ticks()`: joins funding and price data, yields MarketTick with predicted rates populated
+- Normalized schema: `venues` and `symbols` lookup tables with integer PKs
+- `funding_ticks` and `price_ticks` reference lookups via integer FKs
+- All timestamps as INTEGER (Unix epoch seconds)
+- `insert_funding_ticks()`: resolves venue/symbol strings to FKs, stores rate_1h + predicted_rate_1h + time_of_next_funding
+- `insert_price_ticks()`: resolves venue/symbol strings to FKs, stores best_bid, best_ask, mark_price
+- `iter_ticks()`: joins through lookup tables, yields MarketTick with human-readable names and predicted rates populated
 - WAL mode enabled by default
-- Minute-precision timestamps on price_ticks
+- Batch inserts for write efficiency
 
 **Acceptance:**
 - Insert + read roundtrip test passes
+- Lookup tables auto-populated on first encounter (INSERT OR IGNORE)
 - Yields correct MarketTick with `predicted_rate` populated (not None) when data exists
 - Yields MarketTick with bid/ask from nearest-minute price_tick
+- Integer timestamps throughout — no ISO-8601 strings in DB
 
 ---
 

@@ -9,7 +9,7 @@
 
 ## Executive Summary
 
-hummingbot-lab is a from-scratch backtesting and paper-trading facility for OpenClaw strategies. It collects live market data via dex-factory adapters into SQLite, replays historical ticks through the same strategy code that runs live, and renders dashboards from strategy state.
+hummingbot-lab is a from-scratch backtesting and paper-trading facility for Hummingbot strategies. It collects live market data via dex-factory adapters into SQLite, replays historical ticks through the same strategy code that runs live, and renders dashboards from strategy state.
 
 The strategy is a **self-contained, environment-agnostic package** that both lab and trade import identically. The two environments differ only in where ticks come from and how decisions get executed. Strategy math is the core IP — it lives in its own repo with independent versioning, its own CI, and a clean dependency graph where lab and trade both depend on it without depending on each other.
 
@@ -1150,11 +1150,12 @@ Current state from dex-factory:
 | Lighter | Not implemented | Unknown | Audit API docs |
 | Paradex | Not implemented | Unknown | Audit API docs |
 
-The base `DexClient` contract returns `[]` by default. Venues without predicted rates gracefully fall back to current rate via `best_estimate_rate()`. The strategy degrades, it doesn't break.
+The base `DexClient` contract returns `[]` by default — a silent escape hatch. There is no contract conformance test that enforces subclasses to either implement or explicitly opt out of each interface method. This is why the gap exists: each venue was built in isolation, and predicted rates only got wired for HL and Pacifica because their builders happened to notice the API field. Extended's `nextFundingRate` is likely being discarded as a timestamp.
 
 **Action items:**
-- File issues to audit Extended, Lighter, and Paradex APIs for predicted rate fields
-- Fix Extended's `nextFundingRate` parsing (it's a rate, not a timestamp)
+- Add a DexClient contract conformance test: parametrize over all subclasses, assert each public method is overridden or explicitly marked unsupported (not silently returning empty)
+- Fix Extended's `nextFundingRate` parsing (investigate whether it's a rate misread as a timestamp)
+- Audit Lighter and Paradex APIs for predicted rate fields
 - Wire `get_predicted_funding_rates()` into every venue that supports it
 - Collector stores whatever each venue provides; `None` where unavailable
 

@@ -1,1022 +1,1452 @@
 # hummingbot-lab Master Plan
 
-> Backtesting + paper trading facility for OpenClaw strategies.
-> Replaces quants-lab fork. Zero external infra. SQLite-only.
+> Strategy as a portable object. Backtest is not a second-class citizen.
 
-**Date:** 2026-03-29
-**Status:** Draft — awaiting review
+**Date:** 2026-04-01
+**Status:** Draft
 
 ---
 
 ## Executive Summary
 
-hummingbot-lab is a from-scratch rebuild that:
-1. **Collects** live funding snapshots via dex-factory adapters → SQLite
-2. **Replays** historical ticks through the same pure functions that hummingbot-trade uses live
-3. **Paper-trades** by replaying live ticks without executing orders
-4. **Dashboards** every strategy run — same HTML templates, different data source
+hummingbot-lab is a from-scratch backtesting and paper-trading facility for OpenClaw strategies. It collects live market data via dex-factory adapters into SQLite, replays historical ticks through the same strategy code that runs live, and renders dashboards from strategy state.
 
-Everything quants-lab did with MongoDB, Conda, Optuna, and 7k lines of framework
-code gets replaced by ~1.5k lines of focused Python that calls the code we already own.
-
-### What we kill from quants-lab
-
-| Keep | Kill |
-|------|------|
-| Nothing — clean break | `core/` (backtesting engine, task orchestrator, MongoDB client, CLOB data source) |
-| | `app/` (12+ directional strategies, market making, screeners) |
-| | `research_notebooks/` (17 MB of Jupyter) |
-| | `config/` (YAML task templates) |
-| | Conda environment, Makefile, Docker multi-stage |
-| | Motor (async Mongo), Optuna, Papermill, FastAPI task API |
-| | All 40+ Hummingbot connector integrations |
-
-quants-lab was a general-purpose quant research platform. We need a focused
-backtesting tool for *our* strategies that use *our* adapters. Clean break.
+The strategy is a **self-contained, environment-agnostic package** that both lab and trade import identically. The two environments differ only in where ticks come from and how decisions get executed. Strategy math is the core IP — it lives in its own repo with independent versioning, its own CI, and a clean dependency graph where lab and trade both depend on it without depending on each other.
 
 ---
 
 ## Architecture
 
 ```
-dex-factory/                        (unchanged — single source of truth)
-    core/
-    ├── base.py                     DexClient ABC
-    ├── models.py                   FundingData, MarginStatus, ...
-    ├── hyperliquid/client.py       HyperliquidClient
-    ├── extended/client.py          ExtendedClient
-    └── ...
+strategies/                        SEPARATE REPO (pip-installable)
+├── pyproject.toml
+├── protocol.py                    Strategy Protocol definition
+└── dnpm_v2/                       one sub-tree per strategy
+    ├── __init__.py                exports DnpmV2Strategy
+    ├── strategy.py                the black box: tick → decisions
+    ├── scoring.py                 pure math (from trade)
+    ├── hold_evaluator.py          pure math (from trade)
+    ├── entry_gate.py              two-gate filter (from trade)
+    ├── venue.py                   VenueConfig, RateSnapshot
+    ├── scanner_core.py            _scan_pairs + greedy allocation (from Scanner)
+    ├── types.py                   MarketTick, Decision, Fill, StrategyState
+    ├── config.py                  strategy params (portable, no credentials)
+    ├── config_schema.py           pydantic model for config validation
+    ├── templates/
+    │   └── dashboard.html.j2      strategy's own dashboard template
+    └── tests/
+        ├── test_scoring.py        existing tests (moved from trade)
+        ├── test_hold.py
+        ├── test_strategy.py       integration: tick → decisions
+        └── fixtures/              stored ticks for deterministic replay
 
-hummingbot-trade/                   (unchanged — live execution)
-    controllers/dnpm_v2/
-    ├── scanner.py                  uses dex-factory adapters
-    ├── scoring.py                  pure math (φ-decay, TTBE, sizing)
-    ├── hold_evaluator.py           pure math (dual-decay hold model)
-    ├── entry_gate.py               two-gate filter
-    ├── venue.py                    VenueConfig
-    ├── status_snapshot.py          StatusSnapshot schema
-    ├── status_renderer.py          Jinja2 → HTML
-    └── ...
-
-hummingbot-lab/                     (NEW — this repo)
-    ├── collector/
-    │   ├── tick_store.py           SQLite read/write for tick snapshots
-    │   └── collect.py              async script: call adapters → store
-    ├── replay/
-    │   └── engine.py               read ticks → feed strategy → record
-    ├── strategies/
-    │   └── dnpm_v2.py              tick-level adapter for dnpm_v2 pure fns
-    ├── paper/
-    │   └── runner.py               live ticks → strategy → no execution
-    ├── dashboard/
-    │   └── report.py               generate HTML report from run results
-    ├── scripts/
-    │   ├── collect.sh              cron wrapper
-    │   └── backtest.py             CLI entry point
+hummingbot-lab/                    backtest + paper trade
     ├── db/
-    │   └── schema.sql              reference DDL
+    │   ├── tick_store.py          SQLite read/write (dual-table aware)
+    │   └── schema.sql             DDL (funding_ticks + price_ticks)
+    ├── collector/
+    │   ├── collect_funding.py     hourly: rates + predicted rates → funding_ticks
+    │   └── collect_prices.py      per-minute: bid/ask/mark → price_ticks
+    ├── replay/
+    │   └── engine.py              stored ticks → strategy → record
+    ├── paper/
+    │   └── runner.py              live ticks → strategy → no execution
+    ├── dashboard/
+    │   └── renderer.py            strategy.state() → strategy template → HTML
+    ├── scripts/
+    │   └── backtest.py            CLI entry point
     ├── tests/
-    │   ├── test_tick_store.py
-    │   ├── test_replay_engine.py
-    │   └── test_dnpm_v2_adapter.py
-    ├── Dockerfile                  same base as hummingbot-trade
     ├── pyproject.toml
     └── docs/
-        └── MASTER-PLAN.md          (this file)
+        └── MASTER-PLAN.md         (this file)
+
+hummingbot-trade/                  live execution (changes from current)
+    controllers/dnpm_v2/
+    ├── hb_adapter.py              Decision → HB ExecutorAction, Fill ← HB events
+    ├── runner.py                  imports strategy, feeds live ticks
+    ├── controller.py              SLIMMED: delegates to strategy via adapter
+    ├── scanner.py                 SLIMMED: fetch only, scoring moves to strategy
+    ├── config.py                  KEPT: HB-specific config (connectors, credentials)
+    ├── status_snapshot.py         ADAPTED: reads from strategy.state()
+    └── ...
+
+dex-factory/                       unchanged — single source of truth for venue APIs
 ```
 
 ### Data flow
 
 ```
-                    ┌──────────────────────────┐
-                    │     dex-factory adapters  │
-                    │  HyperliquidClient        │
-                    │  ExtendedClient           │
-                    └─────────┬────────────────┘
-                              │
-              ┌───────────────┼───────────────┐
-              │               │               │
-              ▼               ▼               ▼
-        ┌──────────┐   ┌──────────┐   ┌──────────┐
-        │ COLLECT  │   │  LIVE    │   │  PAPER   │
-        │ (cron)   │   │ (trade)  │   │  TRADE   │
-        └────┬─────┘   └──────────┘   └────┬─────┘
-             │                              │
-             ▼                              │
-        ┌──────────┐                        │
-        │  SQLite  │◄───────────────────────┘
-        │ ticks.db │         (paper also writes decisions)
-        └────┬─────┘
-             │
-             ▼
-        ┌──────────┐
-        │  REPLAY  │
-        │  ENGINE  │
-        └────┬─────┘
-             │
-             ▼
-        ┌──────────┐    ┌──────────┐
-        │ Strategy │───▶│ Decision │
-        │ Adapter  │    │ Log      │
-        └──────────┘    └────┬─────┘
-                             │
-                             ▼
-                        ┌──────────┐
-                        │ REPORT   │
-                        │ (HTML)   │
-                        └──────────┘
+              ┌─────────────────────────────────────────┐
+              │         dex-factory adapters             │
+              │  get_funding_rates()                     │
+              │  get_predicted_funding_rates()           │
+              │  get_prices() / get_orderbook()          │
+              └──────────┬──────────────────────────────┘
+                         │
+           ┌─────────────┼──────────────────────┐
+           │             │                      │
+           ▼             ▼                      ▼
+     ┌────────────┐  ┌──────────┐         ┌──────────┐
+     │ COLLECTOR  │  │  TRADE   │         │  PAPER   │
+     │ funding:   │  │ (live)   │         │  TRADE   │
+     │  hourly    │  └────┬─────┘         └────┬─────┘
+     │ prices:    │       │                    │
+     │  1-min     │  FundingData +        FundingData +
+     └────┬───────┘  PredictedFundingData PredictedFundingData
+          │           → MarketTick         → MarketTick
+          │               │                    │
+          ▼               ▼                    ▼
+     ┌──────────┐  ┌──────────────────────────────────┐
+     │  SQLite  │  │   strategies/dnpm_v2/            │
+     │ funding_ │  │   strategy.on_tick()             │
+     │  ticks   │  │         │                        │
+     │ price_   │  │    list[Decision]                │
+     │  ticks   │  │         │                        │
+     └────┬─────┘  └─────────┼────────────────────────┘
+          │                  │
+     MarketTick         ┌────┴──────┐
+     (joined)           │  RUNNER   │
+          │             │ (env-     │
+          ▼             │ specific) │
+     ┌──────────┐       └────┬──────┘
+     │  REPLAY  │            │
+     │  ENGINE  │       Fill (real or simulated)
+     │   ↓      │            │
+     │ strategy │       strategy.on_fill()
+     │ .on_tick │
+     │   ↓      │
+     │ Decision │
+     │   log    │
+     └──────────┘
 ```
 
 ---
 
-## SQLite Schema
+## The Strategy Protocol
 
-### Design principles
+### Interface
 
-- One file per venue-pair: `ticks_hl_ext.db` (or one file for everything — see tradeoff below)
-- Append-only tick table — no updates, no deletes
-- Decision log separate from ticks (replay output ≠ raw data)
-- Timestamps as ISO-8601 TEXT (SQLite has no native datetime; TEXT sorts correctly)
-- Rates stored as REAL (float64, same as Python)
+```python
+from typing import Protocol
+from datetime import datetime
 
-### Tradeoff: one DB vs many
+class Strategy(Protocol):
+    """
+    A strategy is a stateful black box.
 
-One file (`lab.db`) is simpler for queries that span venues. Multiple files
-would let us shard by venue pair but adds complexity for cross-venue strategies
-that need both sides. **Recommendation: single file.** SQLite handles tens of
-millions of rows fine, and our tick rate is ~1 row per symbol per hour.
+    It receives market data, emits trading decisions, and accepts
+    execution feedback. It never performs I/O. It never knows which
+    environment it runs in.
+    """
 
-### Tables
+    def configure(self, config: dict) -> None:
+        """
+        Initialize strategy with parameters.
+
+        Called once before the first tick. Config is a plain dict —
+        strategy validates and stores what it needs.
+        """
+        ...
+
+    def on_tick(self, tick: MarketTick) -> list[Decision]:
+        """
+        Process one market data snapshot. Return trading decisions.
+
+        Called once per tick (hourly for DNPM v2). The strategy:
+        1. Scores all opportunities from tick.rates
+        2. Evaluates existing positions for hold/exit
+        3. Evaluates new entry opportunities
+        4. Returns a list of Decision objects
+
+        Must be deterministic: same tick + same internal state = same output.
+        Must not perform I/O.
+        """
+        ...
+
+    def on_fill(self, fill: Fill) -> None:
+        """
+        Accept execution feedback from the runner.
+
+        Called by the runner after it executes (or simulates) a Decision.
+        The strategy updates its internal position/balance state.
+
+        In backtest: called immediately with simulated fill.
+        In live: called when order confirmation arrives.
+        In paper: called immediately with simulated fill (like backtest).
+        """
+        ...
+
+    def state(self) -> StrategyState:
+        """
+        Return current strategy state for dashboard rendering.
+
+        The returned StrategyState includes everything the dashboard
+        template needs. Called after on_tick() by the runner.
+        """
+        ...
+```
+
+### Why these four methods and not more
+
+**Considered and rejected:**
+
+- `on_balance_update(balance)` — Balance is part of MarketTick. The runner sets it there. Avoids a separate callback channel.
+- `reset()` — Use a new instance. Strategies are cheap.
+- `on_position_sync(positions)` — Reconciliation is a live-only concern. The HB adapter handles it outside the protocol.
+- `finalize() -> dict` — Replaced by `state()`. The runner calls `state()` at the end and extracts summary stats from it.
+
+**Why `on_fill()` exists (not just return-and-forget):**
+
+The strategy needs to update its internal position tracking. Without on_fill(), it would have to assume its decisions were executed perfectly. In live trading, fills are partial, delayed, or rejected. The strategy must know what actually happened to make correct subsequent decisions.
+
+If backtest assumes instant fills, `on_fill()` is still called — it just happens synchronously in the same tick. The strategy code path is identical.
+
+---
+
+## Types
+
+### MarketTick
+
+```python
+@dataclass(frozen=True)
+class MarketTick:
+    """One point in time: all venues, all symbols, plus context."""
+
+    ts: datetime
+    rates: dict[str, list[RateSnapshot]]
+    # symbol → [RateSnapshot per venue]
+    # RateSnapshot carries: venue_id, current_rate, predicted_rate,
+    #                       best_bid, best_ask, timestamp
+
+    available_balance_usd: float
+    # Runner provides this. Backtest: simulated. Live: from exchange.
+    # Strategy uses it for position sizing.
+
+    funding_accruals: list[FundingAccrual] = field(default_factory=list)
+```
+
+**Why `dict[str, list[RateSnapshot]]` and not `list[FundingData]`?**
+
+FundingData is a dex-factory model. The strategy shouldn't depend on dex-factory directly — it adds a transitive dependency and couples the strategy to a specific data source format. RateSnapshot is a clean, minimal dataclass in venue.py with exactly the fields the scoring model needs (venue_id, current_rate, predicted_rate, best_bid, best_ask). The runner converts FundingData → RateSnapshot at the boundary.
+
+**Why `available_balance_usd` on the tick?**
+
+Position sizing needs current balance. In live, this comes from exchange APIs. In backtest, it's tracked by the replay engine's simulated balance. By putting it on the tick, the strategy doesn't need a separate "balance query" mechanism — everything it needs arrives in one shot.
+
+**`RateSnapshot.predicted_rate`** is populated from stored `funding_ticks.predicted_rate_1h` in backtest. The strategy's `best_estimate_rate()` behaves identically in backtest and live — no feature degradation. `best_bid` / `best_ask` come from `price_ticks` at the nearest minute.
+
+### RateSnapshot (in strategies/dnpm_v2/venue.py)
+
+Already exists in trade. Carries `predicted_rate: float | None`.
+
+```python
+@dataclass
+class RateSnapshot:
+    venue_id: str
+    symbol: str
+    current_rate: float             # per-period, in bps
+    predicted_rate: float | None = None
+    mark_price: float = 0.0
+    timestamp: float = 0.0         # unix seconds
+    best_bid: float = 0.0
+    best_ask: float = 0.0
+```
+
+### Decision
+
+```python
+@dataclass(frozen=True)
+class Decision:
+    """A trading decision emitted by the strategy."""
+
+    ts: datetime              # tick timestamp this decision is for
+    action: str               # "enter", "exit", "hold"
+    symbol: str               # canonical symbol
+    venue_a: str              # first venue in pair
+    venue_b: str              # second venue in pair
+    direction: str            # "short_a_long_b" or "long_a_short_b"
+    size_usd: float           # desired position size (0 for exit/hold)
+    score_bps: float          # entry/hold score that motivated this decision
+    reason: str               # human-readable explanation
+    meta: dict                # strategy-specific data (horizon, crossing cost, etc.)
+    position_id: str | None   # for exit/hold: which position this refers to
+```
+
+**What the runner does with each action:**
+
+- `enter`: Translate to venue-specific orders. Execute. Call `on_fill()`.
+- `exit`: Close the referenced position. Call `on_fill()` with close data.
+- `hold`: Log only. No execution. (Important for decision log completeness.)
+
+**Why `meta: dict`?**
+
+Different strategies log different diagnostic data. DNPM v2 logs crossing_cost_bps, best_horizon, fee_roundtrip, etc. A future strategy might log entirely different metrics. The structured fields (symbol, venue_a, etc.) cover what every strategy needs; meta covers what's strategy-specific.
+
+### Fill
+
+```python
+@dataclass(frozen=True)
+class Fill:
+    """Execution feedback from the runner to the strategy."""
+
+    decision_id: str          # links back to the Decision
+    ts: datetime              # when fill occurred
+    action: str               # "enter" or "exit" (mirrors decision)
+    symbol: str
+    venue_a: str
+    venue_b: str
+    direction: str
+    size_usd: float           # actual filled size (may differ from requested)
+    fill_price_a: float       # execution price on venue A (0 if no fill)
+    fill_price_b: float       # execution price on venue B (0 if no fill)
+    status: str               # "filled", "partial", "rejected", "timeout"
+    entry_cost_bps: float     # actual crossing cost at fill time
+    position_id: str          # runner assigns this for new positions
+```
+
+**Backtest fill simulation:**
+
+```python
+# In replay engine:
+for decision in decisions:
+    if decision.action == "enter":
+        fill = simulate_fill(decision, tick)  # instant fill at mid-price
+        strategy.on_fill(fill)
+    elif decision.action == "exit":
+        fill = simulate_exit(decision, tick)
+        strategy.on_fill(fill)
+```
+
+### StrategyState
+
+```python
+@dataclass
+class StrategyState:
+    """Strategy state for dashboard rendering. Strategy-specific."""
+
+    strategy_name: str        # "dnpm_v2"
+    template_name: str        # "dashboard.html.j2" — strategy provides its own
+
+    # Common fields (every strategy provides these)
+    ts: datetime              # last tick time
+    positions: list[dict]     # open positions (schema is strategy-specific)
+    summary: dict             # PnL, trade count, etc.
+
+    # Strategy-specific data (template knows how to render this)
+    scan_results: list[dict]  # top N opportunities (DNPM v2 specific)
+    extra: dict               # anything else the template needs
+```
+
+**Why the template comes with the strategy:**
+
+A funding rate arb strategy shows opportunities, spreads, TTBE. A momentum strategy would show signal strength, correlation, drawdown. The dashboard must be strategy-specific. Shipping the template in the strategy package means:
+1. Lab and trade render identical dashboards for the same strategy
+2. Adding a new strategy automatically adds its dashboard
+3. No need to update lab or trade's rendering code per-strategy
+
+### FundingAccrual
+
+```python
+@dataclass(frozen=True)
+class FundingAccrual:
+    """Funding earned/paid on a position since last tick."""
+    position_id: str
+    amount_bps: float         # positive = earned, negative = paid
+    period_hours: float       # settlement period that just elapsed
+```
+
+Funding accrual is computed by the runner, not the strategy. Each tick, the runner calculates how much funding each position earned since the last tick (using the stored/live rates), and includes these in the MarketTick.
+
+In backtest: replay engine computes accruals from stored rates.
+In live: runner computes accruals from `get_cumulative_funding_since_open()`.
+In both cases: strategy updates `pos.cumulative_funding_bps += accrual.amount_bps`.
+
+This keeps the strategy's hold evaluator correct — it uses `cumulative_funding_received_bps` which stays accurate regardless of environment.
+
+---
+
+## DNPM v2 as a Strategy
+
+### What moves to strategies/dnpm_v2/
+
+| File | Source | Notes |
+|------|--------|-------|
+| `scoring.py` | trade/controllers/dnpm_v2/scoring.py | Verbatim. Pure math, no changes needed. |
+| `hold_evaluator.py` | trade/controllers/dnpm_v2/hold_evaluator.py | Verbatim. Pure math. |
+| `entry_gate.py` | trade/controllers/dnpm_v2/entry_gate.py | Verbatim. Pure math. |
+| `venue.py` | trade/controllers/dnpm_v2/venue.py | Verbatim. VenueConfig + RateSnapshot. |
+| `scanner_core.py` | Extracted from trade/controllers/dnpm_v2/scanner.py | `_scan_pairs()` + greedy allocation. Pure function: rates → scored opportunities. |
+| `types.py` | NEW | MarketTick, Decision, Fill, StrategyState |
+| `strategy.py` | NEW | DnpmV2Strategy implementing the Strategy protocol |
+| `config.py` | Subset of trade/controllers/dnpm_v2/config.py | Strategy params only (no HB connectors, no credentials) |
+| `templates/dashboard.html.j2` | Adapted from trade/.../templates/status.html.j2 | Same visual design, reads from StrategyState |
+
+### scanner_core.py — the extracted scoring engine
+
+The current Scanner._scan_pairs() is already a pure function: `dict[str, list[RateSnapshot]] → list[ScoredOpportunity]`. It imports only from scoring.py and venue.py. Extraction is mechanical:
+
+```python
+# strategies/dnpm_v2/scanner_core.py
+
+from .scoring import (
+    MU_1H, best_estimate_rate, crossing_cost,
+    cumulative_funding, fee_roundtrip, fee_close, score_pair,
+)
+from .venue import VenueConfig, RateSnapshot
+
+@dataclass
+class ScoredOpportunity:
+    symbol: str
+    venue_a: str
+    venue_b: str
+    direction: str
+    horizon_hours: int
+    score_entry: float      # bps
+    score_hold: float       # bps
+    spread_raw: float
+    fee_roundtrip: float
+    rate_a: float
+    rate_b: float
+    crossing_cost_bps: float = 0.0
+
+def scan_pairs(
+    rates: dict[str, list[RateSnapshot]],
+    venue_registry: dict[str, VenueConfig],
+    horizons: list[int],
+    entry_threshold: float = 2.0,
+    staleness_threshold_s: float = 300.0,
+) -> list[ScoredOpportunity]:
+    """Pure function: rates in, scored opportunities out.
+
+    Extracted from Scanner._scan_pairs(). No self, no clients, no state.
+    """
+    ...  # same logic as current _scan_pairs
+```
+
+Trade's Scanner then becomes:
+
+```python
+# In hummingbot-trade, after migration:
+class Scanner:
+    async def scan(self) -> list[RankedOpportunity]:
+        rates = await self._fetch_all_rates()  # still does fetch
+        scored = scan_pairs(rates, self._venue_registry, self.horizons)
+        return self._to_ranked(scored)  # HB compat conversion
+```
+
+### DnpmV2Strategy — the black box
+
+```python
+class DnpmV2Strategy:
+    """DNPM v2: cross-venue funding rate arbitrage."""
+
+    def configure(self, config: dict) -> None:
+        self._venue_registry = build_venue_registry(config)
+        self._horizons = config.get("horizons", [1, 2, 4, 8, 16, 24])
+        self._min_score_bps = config.get("min_score_bps", 15.0)
+        self._pessimism_factor = config.get("pessimism_factor", 0.95)
+        self._phi = config.get("phi", 0.98)
+        self._hold_params = HoldParams(
+            phi_per_hour=config.get("phi_per_hour", 0.98),
+            psi_per_minute=config.get("psi_per_minute", 0.50),
+            lookahead_hours=config.get("hold_lookahead_hours", 1.0),
+        )
+        self._size_floor_pct = config.get("size_floor_pct", 0.10)
+        self._size_cap_pct = config.get("size_cap_pct", 0.25)
+        self._size_scale_per_bps = config.get("size_scale_per_bps", 0.05)
+        self._positions: list[InternalPosition] = []
+        self._closed: list[InternalPosition] = []
+        self._last_scan: list[ScoredOpportunity] = []
+        self._tick_count = 0
+
+    def on_tick(self, tick: MarketTick) -> list[Decision]:
+        self._tick_count += 1
+        decisions = []
+
+        # 1. Score all cross-venue pairs
+        self._last_scan = scan_pairs(
+            tick.rates,
+            self._venue_registry,
+            self._horizons,
+        )
+
+        # 2. Evaluate existing positions
+        for pos in list(self._positions):
+            hold_decision = self._evaluate_hold(pos, tick)
+            if hold_decision.action == "exit":
+                decisions.append(self._make_exit_decision(pos, tick, hold_decision))
+            else:
+                decisions.append(self._make_hold_decision(pos, tick, hold_decision))
+
+        # 3. Evaluate new entries (entry gate + sizing)
+        for opp in self._last_scan:
+            if self._passes_entry_gate(opp):
+                size = self._compute_size(opp, tick.available_balance_usd)
+                if size > 0:
+                    decisions.append(self._make_enter_decision(opp, tick, size))
+
+        return decisions
+
+    def on_fill(self, fill: Fill) -> None:
+        if fill.action == "enter" and fill.status in ("filled", "partial"):
+            self._positions.append(InternalPosition(
+                position_id=fill.position_id,
+                symbol=fill.symbol,
+                venue_a=fill.venue_a,
+                venue_b=fill.venue_b,
+                direction=fill.direction,
+                size_usd=fill.size_usd,
+                entry_ts=fill.ts,
+                entry_cost_bps=fill.entry_cost_bps,
+                cumulative_funding_bps=0.0,
+            ))
+        elif fill.action == "exit":
+            pos = self._find_position(fill.position_id)
+            if pos:
+                self._positions.remove(pos)
+                self._closed.append(pos)
+
+    def state(self) -> StrategyState:
+        return StrategyState(
+            strategy_name="dnpm_v2",
+            template_name="dashboard.html.j2",
+            ts=...,
+            positions=[self._pos_to_dict(p) for p in self._positions],
+            summary=self._compute_summary(),
+            scan_results=[self._opp_to_dict(o) for o in self._last_scan[:20]],
+            extra={},
+        )
+```
+
+### Predicted rates in backtest
+
+`RateSnapshot.predicted_rate` is populated from stored `funding_ticks`. The strategy's `best_estimate_rate()` behaves identically in backtest and live — no feature degradation:
+
+```python
+# In scoring.py (already implemented in trade):
+def best_estimate_rate(snap: RateSnapshot, venue: VenueConfig) -> float:
+    if venue.has_predicted_rate and snap.predicted_rate is not None:
+        return cap_rate(snap.predicted_rate)
+    return cap_rate(snap.current_rate)
+```
+
+Hyperliquid and Pacifica both implement `get_predicted_funding_rates()`. Extended has `nextFundingRate` in its API but parses it as a timestamp — potential bug to investigate. Lighter and Paradex: unknown, needs audit.
+
+The base `DexClient` contract returns `[]` by default. Venues without predicted rates gracefully fall back to current rate via `best_estimate_rate()`. The strategy degrades, it doesn't break.
+
+### What stays in hummingbot-trade
+
+| Component | Why it stays |
+|-----------|-------------|
+| `controller.py` | HB lifecycle integration (ControllerBase subclass) |
+| `hb_adapter.py` (new) | Decision → ExecutorAction translation |
+| `entry.py` | HB order placement (EntryManager) |
+| `management.py` | OpenPosition, PositionManager (HB-specific position tracking) |
+| `router.py` | VenueRouter, VenueState (HB connector-aware) |
+| `scanner.py` | Fetch-only wrapper: clients → FundingData → MarketTick → strategy |
+| `config.py` | Full config including venue_connectors, credentials paths, HB params |
+| `status_snapshot.py` | Reads from strategy.state(), wraps in Pydantic for HB pipeline |
+
+---
+
+## The HB Adapter (hummingbot-trade)
+
+The adapter translates between Strategy decisions and Hummingbot's execution model:
+
+```
+Strategy Decision              HB Action
+─────────────────              ─────────
+enter(sym, venue_a, venue_b,   EntryManager.enter(opportunity)
+      direction, size_usd)      → place limit orders on both venues
+                                → monitor_fill()
+                                → on_fill(Fill)
+
+exit(position_id)              ExitManager.exit_position(position)
+                                → close orders on both venues
+                                → on_fill(Fill)
+
+hold(position_id)              (no-op, logged only)
+```
+
+### Hard translation problems
+
+1. **Order types.** The strategy says "enter at $500 on HL+Extended". HB uses specific order types (limit-at-mid with 4-minute timeout). The adapter encodes this — it's execution policy, not strategy logic.
+
+2. **Partial fills.** Strategy decides to enter; one leg fills, the other doesn't. The adapter must handle this (cancel unfilled leg, report partial Fill to strategy). This is the hardest part of the adapter.
+
+3. **Concurrent positions.** The strategy may emit multiple enter decisions in one tick. The adapter must execute them serially or with careful concurrency to avoid double-allocating balance.
+
+4. **Position reconciliation.** Strategy tracks positions internally via on_fill(). But exchange state may diverge (e.g., manual intervention, unexpected liquidation). The adapter should periodically reconcile and emit corrective fills if needed. This is NOT part of the strategy protocol — it's adapter-level bookkeeping.
+
+5. **Margin monitoring.** The monitor_tick_loop (30s interval for liquidation checks) stays in the adapter/controller. If margin is critical, the adapter force-closes positions and sends exit Fills to the strategy.
+
+### Adapter sketch
+
+```python
+class HbAdapter:
+    """Translates Strategy decisions to HB executor actions."""
+
+    def __init__(self, strategy: DnpmV2Strategy, entry_mgr, exit_mgr, ...):
+        self._strategy = strategy
+        self._entry = entry_mgr
+        self._exit = exit_mgr
+        self._position_map: dict[str, OpenPosition] = {}  # strategy_id → HB position
+
+    async def execute_decisions(self, decisions: list[Decision]) -> None:
+        for d in decisions:
+            if d.action == "enter":
+                result = await self._entry.enter(self._to_opportunity(d))
+                fill_status = await self._entry.monitor_fill(result.order_id)
+                fill = self._to_fill(d, result, fill_status)
+                self._strategy.on_fill(fill)
+            elif d.action == "exit":
+                hb_pos = self._position_map[d.position_id]
+                result = await self._exit.exit_position(hb_pos, ...)
+                fill = self._to_exit_fill(d, result)
+                self._strategy.on_fill(fill)
+```
+
+### What changes in the existing controller
+
+The controller becomes a thin orchestrator:
+
+```python
+class DnpmV2Controller(ControllerBase):
+    async def strategy_tick(self):
+        # 1. Fetch rates from all venues
+        rates = await self._fetch_rates()
+
+        # 2. Build MarketTick
+        tick = MarketTick(
+            ts=now,
+            rates=rates,
+            available_balance_usd=self._get_balance(),
+            funding_accruals=self._compute_accruals(),
+        )
+
+        # 3. Strategy decides
+        decisions = self._strategy.on_tick(tick)
+
+        # 4. Adapter executes
+        await self._adapter.execute_decisions(decisions)
+
+        # 5. Dashboard
+        state = self._strategy.state()
+        self._render_dashboard(state)
+```
+
+This is dramatically simpler than the current controller (which has scan + route + enter + manage + monitor all interleaved).
+
+---
+
+## hummingbot-lab Design
+
+### SQLite Schema
+
+Two tables to support dual-cadence collection: per-minute prices and hourly funding rates.
 
 ```sql
--- Raw tick snapshots from collector
-CREATE TABLE ticks (
-    id          INTEGER PRIMARY KEY,
-    ts          TEXT    NOT NULL,  -- ISO-8601 UTC
-    venue       TEXT    NOT NULL,  -- "hyperliquid", "extended"
-    symbol      TEXT    NOT NULL,  -- canonical: "BTC", "ETH"
-    rate_1h     REAL    NOT NULL,  -- funding_rate_1h from FundingData
-    best_bid    REAL,              -- nullable (not all venues provide)
-    best_ask    REAL,              -- nullable
-    settlement_period_hours REAL NOT NULL DEFAULT 1.0,
-    is_hip3     INTEGER NOT NULL DEFAULT 0,
-    dex_name    TEXT    NOT NULL DEFAULT '',
-    -- collector metadata
-    batch_id    TEXT    NOT NULL   -- groups rows from same collection run
+-- Hourly funding rate snapshots (one row per venue/symbol per hour)
+CREATE TABLE funding_ticks (
+    id                      INTEGER PRIMARY KEY,
+    ts                      TEXT    NOT NULL,  -- ISO 8601, hourly granularity
+    venue                   TEXT    NOT NULL,
+    symbol                  TEXT    NOT NULL,
+    rate_1h                 REAL    NOT NULL,  -- current funding rate (decimal, per-hour)
+    predicted_rate_1h       REAL,              -- predicted next funding rate (decimal, per-hour)
+    time_of_next_funding    INTEGER,           -- unix ms of next settlement
+    settlement_period_hours REAL    NOT NULL DEFAULT 1.0,
+    is_hip3                 INTEGER NOT NULL DEFAULT 0,
+    dex_name                TEXT    NOT NULL DEFAULT '',
+    batch_id                TEXT    NOT NULL
 );
 
-CREATE INDEX idx_ticks_symbol_ts ON ticks(symbol, ts);
-CREATE INDEX idx_ticks_venue_ts  ON ticks(venue, ts);
-CREATE INDEX idx_ticks_ts        ON ticks(ts);
+CREATE INDEX idx_funding_ts_venue_sym ON funding_ticks(ts, venue, symbol);
 
--- Replay/paper-trade decision log
+-- Per-minute price snapshots (one row per venue/symbol per minute)
+CREATE TABLE price_ticks (
+    id          INTEGER PRIMARY KEY,
+    ts          TEXT    NOT NULL,  -- ISO 8601, minute granularity
+    venue       TEXT    NOT NULL,
+    symbol      TEXT    NOT NULL,
+    best_bid    REAL,
+    best_ask    REAL,
+    mark_price  REAL,
+    batch_id    TEXT    NOT NULL
+);
+
+CREATE INDEX idx_price_ts_venue_sym ON price_ticks(ts, venue, symbol);
+
+-- Decision log
 CREATE TABLE decisions (
     id          INTEGER PRIMARY KEY,
-    run_id      TEXT    NOT NULL,  -- identifies the backtest/paper run
-    ts          TEXT    NOT NULL,  -- tick timestamp this decision is for
-    strategy    TEXT    NOT NULL,  -- "dnpm_v2"
+    run_id      TEXT    NOT NULL,
+    ts          TEXT    NOT NULL,
+    strategy    TEXT    NOT NULL,
     symbol      TEXT    NOT NULL,
-    action      TEXT    NOT NULL,  -- "enter", "hold", "exit", "skip"
-    direction   TEXT,              -- "long_a_short_b" or null
+    action      TEXT    NOT NULL,     -- "enter", "exit", "hold"
+    direction   TEXT,
     venue_a     TEXT,
     venue_b     TEXT,
     score_bps   REAL,
-    reason      TEXT,              -- human-readable
-    meta        TEXT               -- JSON blob for strategy-specific data
+    size_usd    REAL,
+    reason      TEXT,
+    meta        TEXT,                 -- JSON
+    position_id TEXT
 );
-
-CREATE INDEX idx_decisions_run ON decisions(run_id, ts);
 
 -- Run metadata
 CREATE TABLE runs (
     run_id      TEXT PRIMARY KEY,
     strategy    TEXT    NOT NULL,
-    mode        TEXT    NOT NULL,  -- "backtest" or "paper"
+    mode        TEXT    NOT NULL,
     started_at  TEXT    NOT NULL,
     ended_at    TEXT,
-    config      TEXT    NOT NULL,  -- JSON: full config snapshot
-    summary     TEXT               -- JSON: final PnL, stats, etc.
+    config      TEXT    NOT NULL,     -- JSON
+    summary     TEXT                  -- JSON
 );
 ```
 
-### Why not store predicted rates?
+**Why two tables instead of one wide table:**
+- price_ticks has 1440× more rows per day than funding_ticks. Mixing them would make funding queries scan through millions of price rows.
+- Different retention policies: price_ticks can be compacted to 5-min or 15-min after 90 days. Funding_ticks are small enough to keep forever.
+- Separate indexes are more efficient for the two query patterns: "funding rates for a time range" vs "bid/ask at a specific minute."
 
-FundingData doesn't carry predicted rates. PredictedFundingData is a separate
-model and only Hyperliquid supports it. If we need it later, add a
-`predicted_rate_1h` nullable column to `ticks`. Don't pre-build for it now.
+**Storage math:**
+- price_ticks: 4 venues × 100 symbols × 1440 min/day × ~80 bytes/row ≈ 46 MB/day ≈ 17 GB/year
+- funding_ticks: 4 venues × 100 symbols × 24 hours/day × ~80 bytes/row ≈ 0.77 MB/day ≈ 280 MB/year
+- SQLite with WAL mode handles this write volume comfortably. If write throughput becomes an issue (unlikely), first optimization: batch inserts per venue. Fallback: Redis as write buffer with periodic flush to SQLite.
 
----
+### Collector (dual-cadence)
 
-## Tick Interface
-
-### What the collector stores
-
-One row per `FundingData` returned by `client.get_funding_rates()`:
-
-```python
-@dataclass(frozen=True)
-class FundingData:          # from dex-factory/core/models.py
-    venue: str              # "hyperliquid", "extended"
-    symbol: str             # "BTC", "ETH", "xyz:TSLA"
-    funding_rate_1h: float  # already per-hour
-    is_hip3: bool = False
-    dex_name: str = ""
-    best_bid: float | None = None
-    best_ask: float | None = None
-    settlement_period_hours: float = 1.0
-```
-
-This maps 1:1 to the `ticks` table. The collector calls
-`client.get_funding_rates()` (same as live scanner) and inserts every
-FundingData as a row.
-
-### What the replay engine feeds to strategy adapters
+Two separate collector scripts, each with its own cron schedule.
 
 ```python
-@dataclass
-class Tick:
-    """One point in time, all venues, all symbols."""
-    ts: datetime
-    funding: dict[str, list[FundingData]]  # venue → [FundingData, ...]
-```
-
-The replay engine groups ticks by timestamp and reconstructs the same view
-that `Scanner.scan()` sees in live mode. The strategy adapter receives a
-`Tick` and returns a list of `Decision` objects.
-
-### Is FundingData enough?
-
-**For DNPM v2: yes.** The scanner consumes `get_funding_rates()` which returns
-`list[FundingData]`. The scoring functions consume `rate_1h` values and
-`best_bid`/`best_ask` for crossing cost. That's all in FundingData.
-
-**What's NOT in FundingData that live uses:**
-- `get_balance()` → needed for position sizing. Paper mode simulates this.
-- `get_positions()` → live-only. Replay tracks positions in-memory.
-- `get_margin_status()` → live-only. Paper mode can approximate.
-- `get_predicted_funding_rates()` → HL-only, not stored. Scoring uses
-  `best_estimate_rate()` which falls back to current rate if no prediction.
-
-**Verdict:** FundingData is the right tick granularity. Position state and
-balance are simulation concerns, not data concerns.
-
----
-
-## Replay Engine Design
-
-### Core loop
-
-```python
-class ReplayEngine:
-    def __init__(self, db_path: str, strategy: StrategyAdapter):
-        self.store = TickStore(db_path)
-        self.strategy = strategy
-
-    def run(self, start: datetime, end: datetime, config: dict) -> RunResult:
-        run_id = uuid4().hex[:12]
-        self.strategy.initialize(config)
-
-        for tick in self.store.iter_ticks(start, end):
-            decisions = self.strategy.on_tick(tick)
-            for d in decisions:
-                self.store.log_decision(run_id, d)
-
-        summary = self.strategy.finalize()
-        self.store.save_run(run_id, config, summary)
-        return RunResult(run_id=run_id, summary=summary)
-```
-
-### Key properties
-
-1. **Deterministic.** Same ticks + same config = same output. No network calls.
-2. **No lookahead.** `iter_ticks()` yields in chronological order. Strategy
-   only sees current and past ticks.
-3. **Strategy owns state.** The engine doesn't know about positions, PnL, or
-   sizing. The strategy adapter tracks all of that internally.
-4. **Decision log is the output.** Every action (enter, hold, exit, skip) is
-   logged with its reasoning. The report is generated from this log.
-
-### iter_ticks()
-
-```python
-def iter_ticks(self, start: datetime, end: datetime) -> Iterator[Tick]:
-    """Yield one Tick per distinct timestamp in range."""
-    rows = self.db.execute(
-        "SELECT * FROM ticks WHERE ts >= ? AND ts <= ? ORDER BY ts",
-        (start.isoformat(), end.isoformat())
-    )
-    for ts, group in itertools.groupby(rows, key=lambda r: r['ts']):
-        funding = defaultdict(list)
-        for row in group:
-            funding[row['venue']].append(row_to_funding_data(row))
-        yield Tick(ts=datetime.fromisoformat(ts), funding=dict(funding))
-```
-
-### What about fill simulation?
-
-Live uses `EntryManager.enter()` → `monitor_fill()` with timeout logic. In
-replay, we assume **instant fill at mid-price** (or at best_bid/best_ask if
-available). This is a simplification, but:
-
-- DNPM v2 uses limit-at-mid with 4-minute timeout
-- Funding rate arb has wide spreads, so fill probability is high
-- Slippage modeling adds complexity without proportional insight
-
-If we need fill simulation later, add it as a pluggable `FillModel` to the
-strategy adapter. Don't build it now.
-
----
-
-## Collector Design
-
-### What it does
-
-1. Create aiohttp session
-2. Create dex-factory clients (HyperliquidClient, ExtendedClient)
-3. Call `client.get_funding_rates()` on each — **same method live uses**
-4. Insert all FundingData rows into SQLite with shared batch_id
-5. Close session
-
-### collect.py
-
-```python
-async def collect(db_path: str, venues: list[str]) -> int:
-    """Collect one snapshot from all venues. Returns row count."""
+# collector/collect_funding.py — runs hourly
+async def collect_funding(db_path: str, venues: list[str]) -> int:
+    """Collect funding rates + predicted rates from all venues."""
     batch_id = datetime.utcnow().strftime("%Y%m%dT%H%M%S")
     store = TickStore(db_path)
-
     async with aiohttp.ClientSession() as session:
         clients = build_clients(session, venues)
         for venue_name, client in clients.items():
             rates = await client.get_funding_rates()
-            store.insert_ticks(batch_id, rates)
+            predicted = await client.get_predicted_funding_rates()
 
+            # Index predicted rates for O(1) lookup
+            pred_by_sym = {p.symbol: p for p in predicted}
+
+            store.insert_funding_ticks(batch_id, rates, pred_by_sym)
     return store.batch_count(batch_id)
 ```
 
-### collect.sh (cron wrapper)
-
-```bash
-#!/usr/bin/env bash
-set -euo pipefail
-cd "$(dirname "$0")/.."
-python -m collector.collect --db data/lab.db --venues hyperliquid,extended
+```python
+# collector/collect_prices.py — runs every minute
+async def collect_prices(db_path: str, venues: list[str]) -> int:
+    """Collect bid/ask/mark prices from all venues."""
+    batch_id = datetime.utcnow().strftime("%Y%m%dT%H%M%S")
+    store = TickStore(db_path)
+    async with aiohttp.ClientSession() as session:
+        clients = build_clients(session, venues)
+        for venue_name, client in clients.items():
+            rates = await client.get_funding_rates()
+            # FundingData already carries best_bid, best_ask
+            store.insert_price_ticks(batch_id, venue_name, rates)
+    return store.batch_count(batch_id)
 ```
 
-Cron: `2 * * * *` (at HH:02, matching live strategy tick timing).
+Cron:
+```
+2  *  *  *  *  python -m collector.collect_funding   # hourly at :02
+*  *  *  *  *  python -m collector.collect_prices     # every minute
+```
 
-### No credentials needed
+**Why `get_funding_rates()` for price collection?** FundingData already carries `best_bid`, `best_ask` from the venue's API response. A separate price endpoint isn't needed. The funding rate fields are ignored (or could be used for sub-hourly rate tracking later).
 
-The collector only calls `get_funding_rates()` — a **public, unauthenticated**
-endpoint on both Hyperliquid and Extended. No API keys, no wallets, no secrets.
-This is a huge simplification vs. live.
+**Alternative for price collection:** If `get_funding_rates()` is too heavy for per-minute calls (it fetches all symbols including rate computation), consider adding a lightweight `get_prices()` override that returns just bid/ask/mark. Hyperliquid's `get_prices()` already exists in the base class. Defer this optimization until we measure actual collection latency.
 
-### HIP-3 support
+No credentials are needed — the collector only calls public, unauthenticated endpoints.
 
-HyperliquidClient has `get_all_funding_rates(include_hip3=True)` which fetches
-main perps + all HIP-3 DEXes concurrently. The collector should use this
-instead of plain `get_funding_rates()` to capture the full universe. The
-`is_hip3` and `dex_name` fields in the tick table handle this.
-
----
-
-## Strategy Adapter Pattern
-
-### Interface
+### TickStore
 
 ```python
-class StrategyAdapter(Protocol):
-    def initialize(self, config: dict) -> None: ...
-    def on_tick(self, tick: Tick) -> list[Decision]: ...
-    def finalize(self) -> dict: ...  # summary stats
+class TickStore:
+    def insert_funding_ticks(
+        self, batch_id: str, rates: list[FundingData],
+        predicted: dict[str, PredictedFundingData],
+    ) -> int:
+        """Insert hourly funding rates with predicted rates."""
+        ...
+
+    def insert_price_ticks(
+        self, batch_id: str, venue: str, rates: list[FundingData],
+    ) -> int:
+        """Insert per-minute bid/ask/mark prices."""
+        ...
+
+    def iter_ticks(
+        self, start: datetime, end: datetime,
+        initial_balance: float = 1000.0,
+        tick_interval_minutes: int = 60,
+    ) -> Iterator[MarketTick]:
+        """Yield MarketTicks by joining funding and price data.
+
+        For each tick timestamp:
+        1. Funding rates: latest funding_ticks at or before this timestamp
+        2. Predicted rates: from the same funding_ticks row
+        3. Bid/ask: from price_ticks at the nearest minute
+        """
+        ...
+
+    def log_decision(self, run_id: str, decision: Decision) -> None: ...
+    def save_run(self, run_id: str, config: dict, summary: dict) -> None: ...
 ```
 
-### DNPM v2 adapter
-
-The adapter wraps the pure functions from hummingbot-trade without importing
-the controller or any Hummingbot-specific code:
+**iter_ticks with predicted rates:**
 
 ```python
-from controllers.dnpm_v2.scoring import score_pair, compute_ttbe, fee_roundtrip
-from controllers.dnpm_v2.hold_evaluator import evaluate_hold
-from controllers.dnpm_v2.entry_gate import passes_entry_gate
-from controllers.dnpm_v2.venue import VenueConfig
+def iter_ticks(self, start, end, initial_balance=1000.0,
+               tick_interval_minutes=60) -> Iterator[MarketTick]:
+    # Query funding ticks (hourly) and price ticks (nearest minute)
+    for ts in self._tick_timestamps(start, end, tick_interval_minutes):
+        funding_rows = self._funding_at(ts)   # latest funding at or before ts
+        price_rows = self._prices_at(ts)      # price_ticks at nearest minute
 
-class DnpmV2Adapter:
-    """Replay adapter for DNPM v2 strategy."""
+        rates = defaultdict(list)
+        for row in funding_rows:
+            # Find matching price data
+            price = price_rows.get((row['venue'], row['symbol']))
 
-    def initialize(self, config: dict) -> None:
-        self.venues = load_venue_configs(config)
-        self.min_score_bps = config['min_score_bps']
-        self.positions: list[SimPosition] = []
-        self.balance = config.get('initial_balance_usd', 1000.0)
-        self.history: list[dict] = []
+            snap = RateSnapshot(
+                venue_id=row['venue'],
+                symbol=row['symbol'],
+                current_rate=row['rate_1h'] * 10000 * row['settlement_period_hours'],
+                predicted_rate=(
+                    row['predicted_rate_1h'] * 10000 * row['settlement_period_hours']
+                    if row['predicted_rate_1h'] is not None else None
+                ),
+                best_bid=price['best_bid'] if price else 0.0,
+                best_ask=price['best_ask'] if price else 0.0,
+                mark_price=price['mark_price'] if price else 0.0,
+                timestamp=ts_to_unix(ts),
+            )
+            rates[row['symbol']].append(snap)
 
-    def on_tick(self, tick: Tick) -> list[Decision]:
-        decisions = []
-
-        # 1. Score all cross-venue pairs (same logic as Scanner.scan)
-        opportunities = self._score_opportunities(tick)
-
-        # 2. Evaluate existing positions for exit
-        for pos in list(self.positions):
-            hold = self._evaluate_hold(pos, tick)
-            if hold.action == 'exit':
-                decisions.append(self._close(pos, tick, hold.reason))
-
-        # 3. Evaluate new entries
-        for opp in opportunities:
-            if passes_entry_gate(opp.score, self.min_score_bps, ...):
-                decisions.append(self._enter(opp, tick))
-
-        return decisions
-
-    def finalize(self) -> dict:
-        return {
-            'total_pnl_bps': sum(p.realized_pnl for p in self.history),
-            'num_trades': len(self.history),
-            'win_rate': ...,
-            ...
-        }
+        yield MarketTick(
+            ts=datetime.fromisoformat(ts),
+            rates=dict(rates),
+            available_balance_usd=initial_balance,
+        )
 ```
 
-### Why not import Scanner directly?
+**tick_interval_minutes:** Default 60 for hourly backtests. Can be set to 1 for minute-level backtests that test dislocation behavior. At 1-minute granularity, funding rates repeat (they're hourly), but bid/ask changes every minute — which is exactly what the hold evaluator's dislocation model needs. The hold evaluator's ψ-per-minute model requires sub-hourly bid/ask data to be meaningful; with hourly snapshots, ψ^60 ≈ 0 and the dislocation term vanishes.
 
-Scanner depends on live clients (HyperliquidClient, ExtendedClient) for
-fetching rates. In replay, rates come from SQLite. The adapter calls the
-same *math* functions (score_pair, fee_roundtrip, evaluate_hold) but
-feeds them stored data instead of live data. Scanner's `scan()` method
-does too much (fetch + score + filter) to be reusable without the clients.
-
-**Alternative considered:** refactor Scanner into `scan_from_rates(rates)` and
-`scan_from_live(clients)`. This is cleaner but requires changing
-hummingbot-trade code. We should do this eventually (see issue #7 below) but
-the adapter approach works without touching live code.
-
----
-
-## Dashboard Integration
-
-### Live dashboard (existing)
-
-hummingbot-trade has:
-- `StatusSnapshot` (Pydantic model) → data
-- `StatusRenderer` (Jinja2) → HTML
-- `StatusWriter` → YAML
-
-The template (`status.html.j2`) renders opportunities and positions.
-
-### Backtest report
-
-A backtest report is fundamentally different from a live dashboard:
-- Live shows current state; backtest shows a completed run
-- Live has opportunities + positions; backtest has a decision timeline + PnL curve
-- Live refreshes; backtest is static
-
-**Recommendation:** Don't reuse the live template. Build a separate
-`report.html.j2` that renders from the decision log:
-
-```
-┌─────────────────────────────────────────────┐
-│  DNPM v2 Backtest — 2026-03-01 → 2026-03-28 │
-├─────────────────────────────────────────────┤
-│  Total PnL: +42.3 bps                       │
-│  Trades: 18 (14W / 4L)                      │
-│  Avg hold: 6.2 hours                        │
-│  Max drawdown: -8.1 bps                     │
-├─────────────────────────────────────────────┤
-│  [Decision timeline table]                   │
-│  ts | symbol | action | score | pnl | reason│
-│  ...                                         │
-├─────────────────────────────────────────────┤
-│  [PnL curve — inline SVG or ASCII]          │
-└─────────────────────────────────────────────┘
-```
-
-Self-contained HTML, no JS frameworks, same pattern as live (Jinja2 + atomic write).
-
-### Shared code
-
-The *data models* from hummingbot-trade (VenueConfig, scoring functions) are
-shared. The *presentation* is not. This is fine — strategies are different,
-dashboards are different. That's principle #4.
-
----
-
-## Paper Trading Mode
-
-Paper trading = replay engine running on **live ticks instead of stored ticks**.
+### Replay Engine
 
 ```python
-class PaperRunner:
-    def __init__(self, strategy: StrategyAdapter, db_path: str, venues: list[str]):
-        self.strategy = strategy
-        self.store = TickStore(db_path)
-        self.venues = venues
-
-    async def run(self, config: dict):
+class ReplayEngine:
+    def run(self, start, end, config: dict) -> RunResult:
         run_id = uuid4().hex[:12]
-        self.strategy.initialize(config)
+        self.strategy.configure(config)
+        balance = config.get("initial_balance_usd", 1000.0)
+        tick_interval = config.get("tick_interval_minutes", 60)
 
-        while True:
-            # 1. Collect live tick (same as collector)
-            tick = await self._fetch_live_tick()
-
-            # 2. Store it (builds history for later replay)
-            self.store.insert_ticks(tick.batch_id, tick.funding_flat())
-
-            # 3. Feed to strategy
+        for tick in self.store.iter_ticks(start, end, balance, tick_interval):
+            tick = self._add_accruals(tick)
             decisions = self.strategy.on_tick(tick)
+
             for d in decisions:
                 self.store.log_decision(run_id, d)
+                if d.action == "enter":
+                    fill = self._simulate_fill(d, tick)
+                    self.strategy.on_fill(fill)
+                    balance -= fill.size_usd
+                elif d.action == "exit":
+                    fill = self._simulate_exit(d, tick)
+                    self.strategy.on_fill(fill)
+                    balance += fill.size_usd + self._compute_pnl(fill)
 
-            # 4. Wait for next settlement
-            await asyncio.sleep(self._seconds_until_next_tick())
+        state = self.strategy.state()
+        self.store.save_run(run_id, config, state.summary)
+        return RunResult(run_id=run_id, state=state)
 ```
 
-### Key insight
-
-Paper trading is *not* a third mode. It's:
-- **Collector** (store live ticks) +
-- **Replay** (feed to strategy) +
-- **No execution**
-
-running in a loop. The only difference from offline replay is the tick source
-(live API vs. SQLite). The strategy adapter is identical.
-
-### Simulated balance
-
-Paper mode needs a simulated balance tracker:
+**Fill simulation:** Instant fill at mid-price (or at best_bid/best_ask if available). This is a conservative simplification — DNPM v2 uses limit-at-mid with 4-minute timeout, and funding rate arb has wide spreads making fill probability high. If fill simulation needs refinement later, add a pluggable `FillModel`.
 
 ```python
-class SimBalance:
-    def __init__(self, initial_usd: float):
-        self.balance = initial_usd
-        self.reserved = 0.0  # in open positions
+def _simulate_fill(self, decision: Decision, tick: MarketTick) -> Fill:
+    """Instant fill at mid-price. Conservative simplification."""
+    snap_a = self._find_snap(tick, decision.symbol, decision.venue_a)
+    snap_b = self._find_snap(tick, decision.symbol, decision.venue_b)
 
-    def allocate(self, usd: float) -> bool: ...
-    def release(self, usd: float, pnl: float) -> None: ...
-```
+    price_a = (snap_a.best_bid + snap_a.best_ask) / 2 if snap_a else 0.0
+    price_b = (snap_b.best_bid + snap_b.best_ask) / 2 if snap_b else 0.0
 
-This lives in the strategy adapter, not the engine.
+    entry_cost = crossing_cost(
+        snap_a.best_bid, snap_a.best_ask,
+        snap_b.best_bid, snap_b.best_ask,
+        decision.direction,
+    ) if snap_a and snap_b else 0.0
 
----
-
-## Multi-Strategy Support
-
-### How strategies coexist
-
-Each strategy is:
-1. A `StrategyAdapter` implementation (e.g., `DnpmV2Adapter`)
-2. Its own config (parameters, venue list, sizing)
-3. Its own decision log (filtered by `strategy` column)
-4. Its own report template
-
-The replay engine doesn't know about strategy internals. It just calls
-`on_tick()` and logs what comes back. Running multiple strategies on the same
-data is just:
-
-```python
-for strategy_name, config in strategies.items():
-    adapter = registry[strategy_name]()
-    engine = ReplayEngine(db_path, adapter)
-    engine.run(start, end, config)
-```
-
-### Strategy registry
-
-Simple dict, no framework:
-
-```python
-STRATEGIES = {
-    "dnpm_v2": DnpmV2Adapter,
-}
-```
-
-Add new strategies by adding a file in `strategies/` and registering it.
-
-### Data sharing
-
-All strategies read from the same `ticks` table. The collector doesn't know
-about strategies — it collects everything. Strategies filter what they need
-via their adapter.
-
----
-
-## Migration Plan (MongoDB → SQLite)
-
-### What's in MongoDB
-
-quants-lab stores:
-- `task_executions`: orchestrator metadata (irrelevant — kill)
-- `funding_rates`: collected funding rate data (potentially useful)
-- Various screener/optimization results (irrelevant)
-
-### Do we actually need to migrate?
-
-**Probably not.** The MongoDB funding_rates collection was populated by
-quants-lab's own collector which used Hummingbot connectors, not dex-factory
-adapters. The data format is different. The symbol naming is different.
-Hummingbot uses `BTC-USD` trading pairs; dex-factory uses `BTC` symbols.
-
-**Recommendation:** Start fresh. Run the new collector for a week to build
-up history, then start backtesting. If we desperately need historical data
-for a longer backtest window, we can:
-
-1. Write a one-off migration script that reads Mongo → normalizes → inserts to SQLite
-2. But honestly, most of the quants-lab data was candle data for different strategies
-
-**If we do migrate:**
-
-```python
-# scripts/migrate_mongo.py
-import pymongo, sqlite3
-
-mongo = pymongo.MongoClient("mongodb://admin:admin@localhost:27017/quants_lab")
-db = sqlite3.connect("data/lab.db")
-
-for doc in mongo.quants_lab.funding_rates.find():
-    db.execute(
-        "INSERT INTO ticks (ts, venue, symbol, rate_1h, batch_id) VALUES (?, ?, ?, ?, ?)",
-        (doc['timestamp'].isoformat(), doc['venue'], normalize_symbol(doc['symbol']),
-         doc['rate'], 'mongo_migration')
+    return Fill(
+        decision_id=decision.id,
+        ts=tick.ts,
+        action="enter",
+        symbol=decision.symbol,
+        venue_a=decision.venue_a,
+        venue_b=decision.venue_b,
+        direction=decision.direction,
+        size_usd=decision.size_usd,
+        fill_price_a=price_a,
+        fill_price_b=price_b,
+        status="filled",
+        entry_cost_bps=entry_cost,
+        position_id=uuid4().hex[:12],
     )
 ```
 
-Estimate: ~2 hours of work if needed. Not a priority.
+### Paper Trading
+
+Paper trading = replay engine running on live ticks instead of stored ticks. It's collector (store live ticks) + replay (feed to strategy) + no execution, running in a loop.
+
+```python
+class PaperRunner:
+    async def run(self, config: dict):
+        self.strategy.configure(config)
+        while not self._stop:
+            tick = await self._fetch_live_tick()
+            self.store.insert_ticks(tick.batch_id, tick.raw_funding)
+            decisions = self.strategy.on_tick(tick)
+            for d in decisions:
+                self.store.log_decision(self.run_id, d)
+                if d.action in ("enter", "exit"):
+                    fill = self._simulate_fill(d, tick)
+                    self.strategy.on_fill(fill)
+            await self._sleep_until_next_tick()
+```
+
+The strategy adapter is identical between paper and backtest. The only difference is the tick source (live API vs. SQLite).
+
+### Dashboard Rendering
+
+Lab provides a generic rendering pipeline. The strategy provides its template.
+
+```python
+class DashboardRenderer:
+    def render(self, strategy_state: StrategyState) -> str:
+        """Load strategy's template, render with its state."""
+        template_dir = strategies_package_path / strategy_state.strategy_name / "templates"
+        env = jinja2.Environment(loader=jinja2.FileSystemLoader(template_dir))
+        template = env.get_template(strategy_state.template_name)
+        return template.render(state=strategy_state)
+```
+
+Same rendering in lab and trade. Strategy determines what's shown.
 
 ---
 
-## Opinionated Challenges to the Approved Architecture
+## strategies/ Repo Structure
 
-### 1. `collector/tick_store.py` should be `db/tick_store.py`
-
-The tick store is used by collector, replay, and paper mode. It's not a
-collector concern — it's the data layer. Move it to `db/`.
-
-**Updated structure:**
 ```
-hummingbot-lab/
-├── db/
-│   ├── tick_store.py      read/write ticks + decisions
-│   └── schema.sql         reference DDL
-├── collector/
-│   └── collect.py         calls adapters → tick_store
-├── replay/
-│   └── engine.py          reads tick_store → strategy
+strategies/                        SEPARATE REPO
+├── pyproject.toml                 pip-installable, zero external deps
+├── protocol.py                    Strategy Protocol definition
+├── dnpm_v2/                       sub-tree: delta-neutral perp maker v2
+│   ├── __init__.py                exports DnpmV2Strategy
+│   ├── strategy.py
+│   ├── scanner_core.py
+│   ├── scoring.py
+│   ├── hold_evaluator.py
+│   ├── entry_gate.py
+│   ├── venue.py                   VenueConfig, RateSnapshot
+│   ├── venue_registry.py          load_venue_registry from YAML/dict
+│   ├── types.py                   MarketTick, Decision, Fill, StrategyState
+│   ├── config.py                  strategy param defaults + validation
+│   ├── config_schema.py           pydantic schema for config validation
+│   ├── templates/
+│   │   └── dashboard.html.j2
+│   └── tests/
+│       ├── conftest.py            shared fixtures
+│       ├── test_scoring.py
+│       ├── test_hold.py
+│       ├── test_entry_gate.py
+│       ├── test_scanner_core.py
+│       ├── test_strategy.py       integration: tick → decisions
+│       └── fixtures/
+│           └── ticks_sample.json
+├── future_strategy/               placeholder: next strategy goes here
+│   └── ...
+└── README.md
 ```
 
-### 2. `collect.sh` is unnecessary
+### pyproject.toml
 
-A 3-line shell script that just calls Python is ceremony. Use cron directly:
+```toml
+[project]
+name = "openclaw-strategies"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = []  # zero external deps — pure Python + stdlib
 
-```cron
-2 * * * * cd /path/to/hummingbot-lab && python -m collector.collect
+[project.optional-dependencies]
+dev = ["pytest>=7.0"]
+schema = ["pydantic>=2.0"]  # only needed if using config_schema.py
+
+[tool.pytest.ini_options]
+testpaths = ["dnpm_v2/tests"]
 ```
 
-Or if you want logging/error handling, make `collect.py` handle it:
+### How lab and trade consume it
 
-```python
-if __name__ == "__main__":
-    asyncio.run(collect(db_path="data/lab.db", venues=["hyperliquid", "extended"]))
+**Development (all repos cloned locally):**
+```bash
+# In lab's or trade's pyproject.toml:
+[project]
+dependencies = [
+    "openclaw-strategies @ file:///${PROJECT_ROOT}/../../strategies"
+]
+
+# Or simpler: editable install
+pip install -e /path/to/strategies
 ```
 
-### 3. "Same Docker image as hummingbot-trade" needs nuance
-
-hummingbot-trade uses `ghcr.io/cryptomaltese/hummingbot-extended:latest` which
-includes the full Hummingbot framework. hummingbot-lab doesn't need Hummingbot
-at all — it only needs:
-- dex-factory (for collector)
-- scoring.py, hold_evaluator.py, entry_gate.py (pure math, no HB deps)
-- aiohttp, sqlite3 (stdlib)
-
-**Recommendation:** Same *base* Python version and key deps, but a much
-lighter image. The pure math modules from hummingbot-trade have a mock
-`__init__.py` that stubs out Hummingbot imports — they're already designed
-to run standalone.
-
+**Docker:**
 ```dockerfile
-FROM python:3.12-slim
-COPY builds/dex-factory /app/dex-factory
-COPY builds/hummingbot-trade/controllers/dnpm_v2 /app/dnpm_v2
-COPY builds/hummingbot-lab /app/lab
-WORKDIR /app/lab
-RUN pip install aiohttp jinja2 pyyaml
+COPY strategies /app/strategies
+RUN pip install -e /app/strategies
 ```
 
-### 4. Symbol universe handling
+**CI:** Each repo's CI clones the strategies repo and installs it before running tests.
 
-Live uses `SymbolUniverse` (24h-cached JSON) to match HL symbols to Extended
-symbols. The collector needs the same matching. Two options:
+### Why a separate repo
 
-- **Option A:** Collector stores raw venue-native symbols; replay does matching
-- **Option B:** Collector normalizes to canonical symbols at collection time
+- **Independence.** Strategy changes don't require lab or trade PRs. Strategy has its own CI, its own version, its own changelog.
+- **Cleaner dependency graph.** Lab depends on strategies. Trade depends on strategies. Neither depends on the other. No circular paths.
+- **Access control.** Strategy math is the core IP. It can have a different access model than the infra repos.
+- **It's basic glue code.** The strategy package is pure math + types. No IO, no frameworks, no build complexity. The overhead of a separate repo is minimal.
 
-**Recommendation: Option B.** Normalize at write time, store canonical symbols.
-This means the collector needs SymbolUniverse (or a simpler static mapping),
-but it makes queries trivial: `WHERE symbol = 'BTC'` instead of joining on
-symbol mappings.
+### Config portability
 
-### 5. The `strategies/` directory will be tiny
+Two-layer config separates strategy params from environment params:
 
-For the foreseeable future, we have one strategy: DNPM v2. Building a plugin
-architecture for one strategy is over-engineering. Start with `dnpm_v2.py`
-in a flat module. If we add a second strategy, *then* refactor.
+```yaml
+# strategy config (portable, checked into strategies/)
+strategy:
+  phi: 0.98
+  horizons: [1, 2, 4, 8, 16, 24]
+  min_score_bps: 15.0
+  size_floor_pct: 0.10
+  size_cap_pct: 0.25
 
-### 6. Consider adding price snapshots to ticks
-
-FundingData has `best_bid` and `best_ask` but not `mark_price` or `index_price`.
-The hold evaluator uses `live_crossing_exit` which is derived from bid/ask
-spreads. For accurate replay of the hold model, we need bid/ask data. These
-are already in FundingData, so we're good — but verify that all venues
-actually populate them. Extended's `get_funding_rates()` returns them;
-Hyperliquid's does too (from the info endpoint). **No action needed, just
-verify during implementation.**
-
-### 7. Eventually refactor Scanner for reuse
-
-The cleanest long-term architecture is:
-
-```python
-# In hummingbot-trade/controllers/dnpm_v2/scanner.py
-class Scanner:
-    def scan_from_rates(self, rates: dict[str, list[FundingData]]) -> list[RankedOpportunity]:
-        """Pure: rates in, scored opportunities out."""
-        ...
-
-    async def scan(self, clients: dict[str, DexClient]) -> list[RankedOpportunity]:
-        """Live: fetch rates, then call scan_from_rates."""
-        rates = {name: await client.get_funding_rates() for name, client in clients.items()}
-        return self.scan_from_rates(rates)
+# environment config (not portable)
+environment:
+  venue_connectors:
+    hyperliquid: hyperliquid_perpetual
+    extended: extended_perpetual
+  fill_timeout_seconds: 240
+  credentials_path: conf/credentials.yml
 ```
 
-This lets hummingbot-lab call `scan_from_rates()` directly with stored data,
-eliminating the need for a separate adapter to re-implement scoring logic.
+The strategy only sees the `strategy` section. The runner handles the `environment` section.
 
-**Don't do this in v1.** The adapter pattern works. But file this as a
-follow-up refactor.
+---
+
+## Hard Problems and Abstraction Leaks
+
+### 1. Scanner decomposition is the critical path
+
+The current Scanner is 900+ lines mixing fetch, convert, score, gate, allocate, hold-evaluate, and rotation-detect. Extracting `scan_pairs()` as a pure function is straightforward — it already is one internally. But the entry gate currently takes a `RankedOpportunity` (HB-specific type). It needs to take a `ScoredOpportunity` instead.
+
+**Risk:** Medium. The entry gate logic is simple (two multiplications and two comparisons). Changing its input type is a one-line change.
+
+### 2. Hold evaluation needs crossing cost from the tick
+
+`evaluate_hold()` takes `live_crossing_exit_bps` — the current bid/ask spread for exiting. In live, this comes from real-time orderbook data. In backtest, it comes from stored bid/ask.
+
+**The leak:** Stored bid/ask is a snapshot at collection time. With per-minute price collection, the dislocation model is meaningful at tick_interval_minutes=1. At hourly granularity, the dislocation term decays to near-zero (ψ^60 ≈ 0), simplifying hold evaluation to funding-only — which is the conservative and correct thing to do with hourly data.
+
+### 3. Position sizing needs balance, balance needs fills
+
+The strategy sizes positions based on `available_balance_usd`. But after emitting an "enter" decision, the balance should decrease. If the strategy emits two enter decisions in one tick, the second one should see the reduced balance.
+
+**Solution:** The strategy reserves balance optimistically as it generates enter decisions within `on_tick()`. If a fill comes back rejected, it un-reserves. This is simpler and matches how the current code works — the router selects ONE best opportunity per tick, preventing double-allocation. The strategy can internally deduct from available balance as it generates entries, and correct on fill/reject.
+
+### 4. Rotation requires knowing current positions AND new opportunities
+
+Rotation decision: "is this new opportunity good enough to replace my worst position?" This requires the strategy to compare new scan results against existing positions. This is already strategy-internal — the strategy knows both its positions and the scan results.
+
+**No leak here.** Rotation is pure strategy logic. The runner just sees enter + exit decisions.
+
+### 5. Config portability
+
+Strategy config (phi, horizons, min_score_bps, size params) must be the same between lab and trade. But trade also needs HB-specific config (connector names, credentials, order timeout).
+
+**Solution:** Two-layer config (see Config Portability section above).
+
+### 6. What happens to SymbolUniverse?
+
+SymbolUniverse currently matches HL symbols to Extended symbols. In the strategy, symbol matching is embedded in `scan_pairs()` — it matches by exact symbol name across venues.
+
+**Status quo works.** dex-factory already normalizes symbols to canonical form. The collector writes canonical symbols. `scan_pairs()` matches by exact name. If edge cases arise (different symbol names across venues), the runner normalizes at the boundary before building the MarketTick.
+
+### 7. Strategy tests without lab or trade
+
+The strategy package must be testable standalone:
+
+```bash
+cd strategies/
+pip install -e .
+pytest dnpm_v2/tests/
+```
+
+No dex-factory imports. No HB imports. No SQLite. Tests use stored fixtures (JSON files with MarketTick data) and verify that `on_tick()` produces expected decisions. This is achievable because the strategy only depends on its own types (venue.py, types.py) and stdlib math.
+
+### 8. Predicted rate coverage across venues
+
+Current state from dex-factory:
+
+| Venue | `get_predicted_funding_rates()` | API field | Status |
+|-------|--------------------------------|-----------|--------|
+| Hyperliquid | Implemented | `predictedFundings` → `fundingRate` + `nextFundingTime` | Working |
+| Pacifica | Implemented | `/info/prices` → `next_funding` | Working |
+| Extended | **Not implemented** | `marketStats.nextFundingRate` exists but parsed as timestamp | Bug — investigate |
+| Lighter | Not implemented | Unknown | Audit API docs |
+| Paradex | Not implemented | Unknown | Audit API docs |
+
+The base `DexClient` contract returns `[]` by default. Venues without predicted rates gracefully fall back to current rate via `best_estimate_rate()`. The strategy degrades, it doesn't break.
+
+**Action items:**
+- File issues to audit Extended, Lighter, and Paradex APIs for predicted rate fields
+- Fix Extended's `nextFundingRate` parsing (it's a rate, not a timestamp)
+- Wire `get_predicted_funding_rates()` into every venue that supports it
+- Collector stores whatever each venue provides; `None` where unavailable
+
+### 9. Sub-hourly collection reliability
+
+The per-minute collector must be robust against:
+- **Transient API failures:** Log and skip. Missing one minute out of 60 is acceptable — the replay engine uses "nearest minute" matching, so it just picks an adjacent minute.
+- **Clock drift:** Use UTC exclusively. Truncate to minute boundary on insert.
+- **Write contention:** SQLite WAL mode allows concurrent reads during writes. Collector does batch inserts (one INSERT per venue per minute, not per-symbol).
+- **Process crashes:** Cron restarts on the next minute. No state to recover.
+
+If write latency becomes a problem (>10s per collection cycle), options in order:
+1. Batch all venue calls with `asyncio.gather()` (should already be doing this)
+2. Reduce symbol set (only collect symbols we've ever traded or scored above threshold)
+3. Redis as write buffer, flush to SQLite every 5 minutes
+4. Per-venue SQLite databases (eliminates write contention entirely)
 
 ---
 
 ## Issue Breakdown
 
-### Phase 1: Foundation (no deps between issues)
+### Phase 0: strategies/ Repo
 
-#### Issue #1: SQLite tick store
-**Title:** Implement tick_store.py — SQLite persistence layer
-**Scope:** `db/tick_store.py`, `db/schema.sql`
+#### Issue #1: Create strategies/ repo with scaffold
+**Scope:** Repo creation, `pyproject.toml`, `protocol.py`, `dnpm_v2/__init__.py`, `dnpm_v2/types.py`
 **Work:**
-- Create `TickStore` class with `__init__(db_path)` that creates DB + tables if not exist
-- `insert_ticks(batch_id: str, rates: list[FundingData]) -> int`
-- `iter_ticks(start: datetime, end: datetime) -> Iterator[Tick]`
-- `log_decision(run_id: str, decision: Decision)`
-- `save_run(run_id, strategy, mode, config, summary)`
-- `get_run(run_id) -> RunMeta`
-- `list_runs(strategy=None, mode=None) -> list[RunMeta]`
-- Schema as defined above
-- Use `sqlite3` stdlib, no ORM
+- Create the repo with the directory structure above
+- Define `Strategy` Protocol in `protocol.py`
+- Define `MarketTick`, `Decision`, `Fill`, `FundingAccrual`, `StrategyState` in `types.py`
+- Zero external deps
+- CI: `pytest` on push
 
-**Acceptance criteria:**
-- Unit tests for insert + read roundtrip
-- `iter_ticks` groups by timestamp and yields `Tick` objects
-- Thread-safe (WAL mode enabled)
-- DB file created automatically on first use
+**Acceptance:**
+- `pip install -e strategies/` works
+- Types are importable: `from dnpm_v2.types import MarketTick`
+- CI green
 
 ---
 
-#### Issue #2: Collector script
-**Title:** Implement async collector using dex-factory adapters
-**Scope:** `collector/collect.py`
+#### Issue #2: Move pure math modules to strategies/
+**Scope:** `strategies/dnpm_v2/{scoring,hold_evaluator,entry_gate,venue,venue_registry}.py`
 **Work:**
-- `async def collect(db_path, venues, include_hip3=True) -> int`
-- Build clients from venue list (no credentials needed)
-- Call `get_funding_rates()` (or `get_all_funding_rates(include_hip3=True)` for HL)
-- Normalize symbols to canonical form using a static mapping (MVP) or SymbolUniverse
-- Insert via `TickStore.insert_ticks()`
-- CLI: `python -m collector.collect --db data/lab.db --venues hyperliquid,extended`
-- Logging to stderr
+- Copy scoring.py, hold_evaluator.py, entry_gate.py, venue.py from trade
+- Fix imports to use relative (within strategies package)
+- Copy existing tests from trade
+- Verify all tests pass
 
-**Acceptance criteria:**
-- Runs successfully against live venues (integration test, not mocked)
-- Inserts correct number of rows
-- Handles venue errors gracefully (log + continue with other venues)
-- Takes < 10s for a full collection run
-
-**Depends on:** #1
+**Acceptance:**
+- All existing scoring/hold/gate tests pass in the new location
+- No dex-factory or HB imports
 
 ---
 
-#### Issue #3: Data models + Tick/Decision types
-**Title:** Define shared data types for replay system
-**Scope:** `models.py` (top-level)
+#### Issue #3: Extract scanner_core.py from Scanner
+**Scope:** `strategies/dnpm_v2/scanner_core.py`, tests
 **Work:**
-- `Tick` dataclass (ts, funding dict)
-- `Decision` dataclass (ts, strategy, symbol, action, direction, venues, score, reason, meta)
-- `RunMeta` dataclass (run_id, strategy, mode, started_at, ended_at, config, summary)
-- `SimPosition` dataclass (symbol, venue_a, venue_b, direction, entry_ts, entry_score, size_usd, cumulative_funding_bps)
-- Keep it minimal — add fields as needed, not speculatively
+- Extract `_scan_pairs()` as standalone `scan_pairs()` function
+- Extract `ScoredOpportunity` dataclass
+- Extract greedy allocation logic
+- Modify entry_gate to accept ScoredOpportunity (not RankedOpportunity)
+- Tests: given fixture rates, verify scored output
 
-**Acceptance criteria:**
-- All types are plain dataclasses (no Pydantic, no framework)
-- Documented with docstrings
-- Importable without side effects
-
-**Depends on:** nothing
+**Acceptance:**
+- `scan_pairs()` is a pure function: no self, no clients, no I/O
+- Produces identical output to Scanner._scan_pairs() for same input
 
 ---
 
-### Phase 2: Replay Engine
-
-#### Issue #4: Replay engine core
-**Title:** Implement replay engine — feed stored ticks to strategy adapter
-**Scope:** `replay/engine.py`
+#### Issue #4: Implement DnpmV2Strategy
+**Scope:** `strategies/dnpm_v2/strategy.py`, `strategies/dnpm_v2/config.py`
 **Work:**
-- `ReplayEngine.__init__(db_path, strategy: StrategyAdapter)`
+- Implement `configure()`, `on_tick()`, `on_fill()`, `state()`
+- Internal position tracking (InternalPosition dataclass)
+- Internal balance tracking
+- Hold evaluation per-position (using hold_evaluator.py)
+- Entry gate filtering (using entry_gate.py)
+- Position sizing (using scoring.py compute_position_size)
+- Integration test: feed 10 ticks, verify decisions and state
+
+**Acceptance:**
+- Deterministic: same ticks + config = same decisions
+- Zero external deps
+- Strategy tests pass standalone: `cd strategies && pytest`
+
+---
+
+#### Issue #5: Strategy dashboard template
+**Scope:** `strategies/dnpm_v2/templates/dashboard.html.j2`
+**Work:**
+- Adapt from trade's status.html.j2
+- Reads from StrategyState (not StatusSnapshot)
+- Shows: scan results table, positions table, summary stats
+- Self-contained HTML, inline CSS
+
+**Acceptance:**
+- Render from fixture StrategyState produces valid HTML
+- Visual parity with current live dashboard (roughly)
+
+---
+
+### Phase 1: Lab Foundation
+
+#### Issue #6: SQLite schema + tick store (dual-table)
+**Scope:** `hummingbot-lab/db/tick_store.py`, `hummingbot-lab/db/schema.sql`
+**Work:**
+- Implement dual-table schema: `funding_ticks` + `price_ticks`
+- `insert_funding_ticks()`: stores rate_1h + predicted_rate_1h + time_of_next_funding
+- `insert_price_ticks()`: stores best_bid, best_ask, mark_price
+- `iter_ticks()`: joins funding and price data, yields MarketTick with predicted rates populated
+- WAL mode enabled by default
+- Minute-precision timestamps on price_ticks
+
+**Acceptance:**
+- Insert + read roundtrip test passes
+- Yields correct MarketTick with `predicted_rate` populated (not None) when data exists
+- Yields MarketTick with bid/ask from nearest-minute price_tick
+
+---
+
+#### Issue #7: Funding collector (hourly)
+**Scope:** `hummingbot-lab/collector/collect_funding.py`
+**Work:**
+- Calls `get_funding_rates()` + `get_predicted_funding_rates()` for each venue
+- Stores both in `funding_ticks` table
+- Handles venues returning empty predicted rates (stores NULL)
+
+**Acceptance:**
+- Collects from HL + Pacifica with predicted rates populated
+- Extended/Lighter/Paradex: rate_1h stored, predicted_rate_1h is NULL
+
+---
+
+#### Issue #8: Price collector (per-minute)
+**Scope:** `hummingbot-lab/collector/collect_prices.py`
+**Work:**
+- Calls `get_funding_rates()` per venue (already returns bid/ask)
+- Stores bid/ask/mark in `price_ticks` table
+- `asyncio.gather()` across venues for parallelism
+- Graceful failure: log warning, skip venue on error
+
+**Acceptance:**
+- Runs in <30s for 4 venues × 100 symbols
+- Missing minutes don't corrupt subsequent queries
+
+---
+
+#### Issue #9: Replay engine
+**Scope:** `hummingbot-lab/replay/engine.py`
+**Work:**
+- `ReplayEngine(db_path, strategy: Strategy)`
 - `run(start, end, config) -> RunResult`
-- Iterates `TickStore.iter_ticks()`, calls `strategy.on_tick()`, logs decisions
-- Writes run metadata on completion
-- Returns RunResult with run_id and summary dict
+- Supports `tick_interval_minutes` config (default 60, can be 1)
+- Feed MarketTick from TickStore to strategy
+- Simulate fills for enter/exit decisions
+- Compute funding accruals between ticks (uses predicted rate when available)
+- Track simulated balance
+- Log all decisions to SQLite
 
-**Acceptance criteria:**
-- Deterministic: same input → same output
-- No network calls during replay
-- Handles empty date ranges gracefully
-- Logs progress (tick count, decision count)
-
-**Depends on:** #1, #3
-
----
-
-#### Issue #5: DNPM v2 strategy adapter
-**Title:** Implement DNPM v2 replay adapter wrapping pure scoring/hold functions
-**Scope:** `strategies/dnpm_v2.py`
-**Work:**
-- Import `score_pair`, `fee_roundtrip`, `compute_ttbe` from hummingbot-trade scoring
-- Import `evaluate_hold` from hold_evaluator (standalone function, not class)
-- Import `passes_entry_gate` (or inline the two-gate logic — it's simple)
-- Import `VenueConfig` from venue module
-- Implement `StrategyAdapter` protocol:
-  - `initialize()`: load venue configs, set params, init SimBalance
-  - `on_tick()`: score opportunities → evaluate holds → make entry/exit decisions
-  - `finalize()`: compute summary stats (PnL, win rate, avg hold, etc.)
-- Track simulated positions + balance internally
-- Cross-venue pair matching (HL symbol ↔ Extended symbol)
-
-**Acceptance criteria:**
-- Uses real scoring.py functions (not reimplemented)
-- Entry gate logic matches live behavior
-- Hold evaluation matches live behavior
-- Position sizing uses `compute_position_size()` from scoring.py
-- Handles case where only one venue has data for a symbol
-- Summary stats include: total_pnl_bps, num_entries, num_exits, win_rate, avg_hold_hours, max_drawdown_bps
-
-**Depends on:** #3, #4
+**Acceptance:**
+- Deterministic replay with fixture data
+- At tick_interval_minutes=1, bid/ask changes every minute (dislocation model is meaningful)
+- Funding accrual uses predicted rates when stored
 
 ---
 
-#### Issue #6: Backtest CLI
-**Title:** CLI entry point for running backtests
-**Scope:** `scripts/backtest.py`
+#### Issue #10: Backtest CLI
+**Scope:** `hummingbot-lab/scripts/backtest.py`
 **Work:**
-- `python -m scripts.backtest --db data/lab.db --strategy dnpm_v2 --start 2026-03-01 --end 2026-03-28 --config config.yml`
-- Load config YAML → merge with defaults
-- Instantiate strategy adapter + replay engine
-- Run + print summary to stdout
-- Optionally write HTML report (--report flag)
+- `python -m scripts.backtest --db data/lab.db --strategy dnpm_v2 --start ... --end ... --config config.yml`
+- `--tick-interval` flag (default 60, option 1 for minute-level)
+- Optionally render dashboard HTML (--report)
 
-**Acceptance criteria:**
-- Exits 0 on success, 1 on failure
-- Prints human-readable summary
-- Config file is optional (uses defaults)
-- Validates date range against available data
-
-**Depends on:** #4, #5
+**Acceptance:**
+- End-to-end: collect → backtest → report works
 
 ---
 
-### Phase 3: Reports + Paper Trading
+### Phase 2: Lab Polish
 
-#### Issue #7: Backtest report generator
-**Title:** HTML report from backtest decision log
-**Scope:** `dashboard/report.py`, `dashboard/templates/report.html.j2`
+#### Issue #11: Dashboard renderer (generic)
+**Scope:** `hummingbot-lab/dashboard/renderer.py`
 **Work:**
-- Read decisions + run metadata from SQLite
-- Compute: PnL curve, trade timeline, per-symbol breakdown
-- Render Jinja2 template → self-contained HTML
-- Inline CSS, no external resources
-- ASCII or inline SVG PnL chart (no JS charting library)
-
-**Acceptance criteria:**
-- Single .html file, opens in any browser
-- Shows: summary stats, decision timeline, per-symbol PnL
-- Matches visual style of live dashboard (roughly)
-
-**Depends on:** #4
+- Load strategy's template from strategy package
+- Render StrategyState → HTML
+- Atomic write to file
 
 ---
 
-#### Issue #8: Paper trading runner
-**Title:** Live paper trading mode — collect + replay in a loop
-**Scope:** `paper/runner.py`
+#### Issue #12: Paper trading runner
+**Scope:** `hummingbot-lab/paper/runner.py`
 **Work:**
-- `PaperRunner(strategy, db_path, venues)`
-- Async loop: fetch live tick → store → feed strategy → log decisions
-- Tick timing: sync to HH:02 UTC (same as live)
-- Graceful shutdown on SIGINT/SIGTERM
-- Write run metadata on stop
-
-**Acceptance criteria:**
-- Runs indefinitely until stopped
-- Stores ticks (doubles as collector)
-- Decisions logged to same schema as backtest
-- Can generate report from paper run using same report tool (#7)
-
-**Depends on:** #2, #5
+- Uses Strategy protocol
+- Fetch live tick (with predicted rates) → build MarketTick → strategy.on_tick() → simulate fills
 
 ---
 
-### Phase 4: Polish + Integration
+### Phase 3: dex-factory — Predicted Rate Audit
 
-#### Issue #9: Dockerfile
-**Title:** Lightweight Docker image for hummingbot-lab
-**Scope:** `Dockerfile`, `pyproject.toml`
+#### Issue #13: Fix Extended `nextFundingRate` parsing
+**Scope:** `dex-factory/core/extended/parsing.py`, `dex-factory/core/extended/client.py`
 **Work:**
-- Based on `python:3.12-slim`
-- Copy dex-factory core + hummingbot-trade pure math modules
-- Install minimal deps (aiohttp, jinja2, pyyaml)
+- `marketStats.nextFundingRate` is currently parsed as a timestamp. Investigate: is it actually a rate or a timestamp?
+- If it's a rate: implement `get_predicted_funding_rates()` for Extended
+- If it's a timestamp: rename the field to avoid confusion, check if another field carries the predicted rate
+
+---
+
+#### Issue #14: Audit Lighter API for predicted rates
+**Scope:** `dex-factory/core/lighter/client.py`
+**Work:**
+- Check Lighter API docs for predicted/next funding rate fields
+- If available: implement `get_predicted_funding_rates()`
+- If not: document and move on (base class returns [])
+
+---
+
+#### Issue #15: Audit Paradex API for predicted rates
+**Scope:** `dex-factory/core/paradex/client.py`
+**Work:**
+- Check Paradex API docs for predicted funding rate fields
+- If available: implement `get_predicted_funding_rates()`
+- If not: document and move on
+
+---
+
+### Phase 4: Trade Migration
+
+#### Issue #16: Update trade Scanner to use scanner_core
+**Scope:** `hummingbot-trade/controllers/dnpm_v2/scanner.py`
+**Work:**
+- Import `scan_pairs` from `strategies.dnpm_v2.scanner_core`
+- Scanner.scan() becomes: fetch → convert → scan_pairs() → convert to RankedOpportunity
+- Delete local `_scan_pairs()`, `_scan_v2()`, `_scan_v2_from_rates()`
+- All existing scanner tests must pass
+
+---
+
+#### Issue #17: Create HB adapter
+**Scope:** `hummingbot-trade/controllers/dnpm_v2/hb_adapter.py`
+**Work:**
+- Decision → HB order translation
+- Fill ← HB event translation
+- Position map (strategy position_id ↔ HB order_id)
+
+---
+
+#### Issue #18: Slim down controller
+**Scope:** `hummingbot-trade/controllers/dnpm_v2/controller.py`
+**Work:**
+- strategy_tick() delegates to strategy.on_tick() + adapter.execute()
+- Remove inline scoring, hold evaluation, entry logic
+- Keep: lifecycle (start/stop), margin monitoring, dashboard pipeline
+
+---
+
+### Phase 5: Infrastructure
+
+#### Issue #19: Lab Dockerfile + cron
+**Scope:** `hummingbot-lab/Dockerfile`, cron configuration
+**Work:**
+- `python:3.12-slim`
+- Install strategies package + dex-factory
+- Two cron entries: hourly funding collection, per-minute price collection
 - Entry point: collector or backtest (configurable)
-- Keep image < 200MB
-
-**Acceptance criteria:**
-- `docker build` succeeds
-- `docker run ... collect` runs collector
-- `docker run ... backtest --help` shows usage
-- No Hummingbot framework in image
-
-**Depends on:** #2, #6
-
----
-
-#### Issue #10: Scanner refactor for data/logic split
-**Title:** Refactor Scanner.scan() into scan_from_rates() + scan_live()
-**Scope:** `hummingbot-trade/controllers/dnpm_v2/scanner.py` (upstream change)
-**Work:**
-- Extract rate-fetching from `scan()` into separate step
-- New `scan_from_rates(rates: dict[str, list[FundingData]]) -> list[RankedOpportunity]`
-- `scan()` becomes: fetch rates → `scan_from_rates()`
-- hummingbot-lab adapter can then call `scan_from_rates()` directly
-- Remove duplicate scoring logic from DnpmV2Adapter
-
-**Acceptance criteria:**
-- `scan()` behavior unchanged (backward compatible)
-- `scan_from_rates()` is a pure function (no I/O)
-- hummingbot-lab adapter simplified to use this directly
-- All existing tests pass
-
-**Depends on:** #5 (adapter works first, then we clean up)
 
 ---
 
 ### Implementation Order
 
 ```
-Phase 1 (parallel):  #1 tick_store  ───┐
-                      #3 data models ──┤
-                      #2 collector  ────┤ (depends on #1)
-                                        │
-Phase 2 (sequential): #4 replay ───────┤ (depends on #1, #3)
-                      #5 adapter ──────┤ (depends on #3, #4)
-                      #6 CLI ──────────┤ (depends on #4, #5)
-                                        │
-Phase 3 (parallel):   #7 report ───────┤ (depends on #4)
-                      #8 paper trade ──┤ (depends on #2, #5)
-                                        │
-Phase 4 (parallel):   #9 Dockerfile ───┤ (depends on #2, #6)
-                      #10 scanner ─────┘ (depends on #5)
+Phase 0 (strategies/ repo — no env deps):
+  #1 scaffold ──┐
+  #2 math  ─────┤  (#2 depends on #1)
+  #3 scanner ───┤  (depends on #2)
+  #4 strategy ──┤  (depends on #1, #2, #3)
+  #5 template ──┘  (depends on #1)
+
+Phase 1 (lab foundation):
+  #6 tick store ────┐  (depends on #1)
+  #7 funding coll ──┤  (depends on #6)
+  #8 price coll ────┤  (depends on #6)
+  #9 replay ────────┤  (depends on #4, #6)
+  #10 CLI ──────────┘  (depends on #9)
+
+Phase 2 (lab polish):
+  #11 dashboard ──┐  (depends on #5, #9)
+  #12 paper ──────┘  (depends on #7, #8, #9)
+
+Phase 3 (dex-factory — predicted rates):   ← can run in parallel with Phase 1
+  #13 Extended fix ──┐
+  #14 Lighter audit ─┤  (all independent)
+  #15 Paradex audit ─┘
+
+Phase 4 (trade migration):                 ← can run in parallel with Phase 1
+  #16 scanner ────┐  (depends on #3)
+  #17 adapter ────┤  (depends on #4)
+  #18 controller ─┘  (depends on #16, #17)
+
+Phase 5 (infra):
+  #19 Dockerfile + cron ──  (depends on Phase 1)
 ```
 
-**Critical path:** #1 → #4 → #5 → #6
+**Critical path:** #1 → #2 → #3 → #4 → #9 → #10 (scaffold → math → scanner → strategy → replay → CLI)
 
-**Estimated total:** 10 focused issues. No issue is larger than a day of work.
-Most are half-day or less.
+**Parallel tracks after Phase 0:**
+- Phase 1 (lab) and Phase 4 (trade migration) are independent
+- Phase 3 (dex-factory audits) is independent of everything — can start immediately
+- Phase 3 results feed into Phase 1 #7 (funding collector stores whatever predicted rates are available)
 
 ---
 
-## Open Questions
+## Migration Safety
 
-1. **Collection frequency:** Hourly matches live tick timing, but should we
-   collect more frequently for higher-resolution replay? (e.g., every 5 min
-   for paper mode simulation.) The schema supports it, but storage grows 12x.
+### The "copy first, then redirect imports" pattern
 
-2. **Multi-account backtesting:** hummingbot-trade supports multi-account via
-   Docker. Should hummingbot-lab simulate multiple accounts? (Probably not —
-   one simulated account is enough for strategy validation.)
+Scoring.py, hold_evaluator.py, etc. currently live in trade and have tests there. The migration:
 
-3. **Historical data bootstrap:** How far back do we need? dex-factory
-   adapters have `get_funding_history(symbol, hours=24)` which gives ~24h of
-   history per call. For longer history, we'd need an archive source or start
-   collecting now and wait.
+1. **Copy** files to strategies/ (Phase 0, issue #2)
+2. **Add tests** in strategies/ that verify identical behavior
+3. **Build lab** importing from strategies/ (Phase 1)
+4. **Update trade** to import from strategies/ instead of local (Phase 4, issue #16)
+5. **Delete** local copies from trade only after trade's tests pass with the redirect
 
-4. **Paradex/Lighter support:** The collector and schema support any venue, but
-   the DNPM v2 adapter is HL+Extended specific. When we add new venue pairs,
-   the adapter needs updating. The collector just needs the venue name.
+At no point does trade break. The local copies remain functional until trade is explicitly migrated. The copy destination is a separate repo, so the migration is a dependency change in trade's pyproject.toml, not a file move.
+
+### Testing the migration
+
+Before Phase 4 issue #18 (slim controller) goes live:
+1. Run the dashboard (live_dashboard.py) with the new Scanner (issue #16)
+2. Run paper trading with the new controller
+3. Compare decisions against the old controller's decisions for the same market data
+4. Only then deploy to live
